@@ -326,3 +326,45 @@ test('a failed result upload retains the active user until acknowledgement, then
   assert.equal(worker.state.conversations[first.session_id],'https://gemini.google.com/app/first');
   assert.equal(worker.state.active.id,second.id);
 });
+
+function imageDownloader(fetcher:typeof fetch){
+ const context=vm.createContext({Date,Math,URL,Blob,AbortSignal,fetch:fetcher,
+  setTimeout:(fn:()=>void)=>{queueMicrotask(fn);return 0;},
+  chrome:{runtime:{onMessage:{addListener(){}}}}});
+ const source=readFileSync(new URL('../apps/gemini-extension/page.js',import.meta.url),'utf8')
+  .replace('setInterval(ready,3000);void ready();','globalThis.downloadForTest=downloadImage;');
+ vm.runInContext(source,context);return (context as any).downloadForTest;
+}
+
+test('image downloads carry browser credentials and retry the asset without resubmitting a prompt',async()=>{
+ const bytes=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=','base64');
+ const calls:{url:string;credentials:unknown}[]=[];
+ const download=imageDownloader(async(url,options)=>{
+  calls.push({url:String(url),credentials:options?.credentials});
+  if(calls.length===1)return new Response('Forbidden',{status:403});
+  return new Response(bytes,{headers:{'content-type':'image/png; charset=binary'}});
+ });
+ const asset={src:'https://lh3.googleusercontent.com/gg-dl/current'};
+ const blob=await download(()=>asset,new AbortController().signal,Date.now()+60_000);
+ assert.deepEqual(Buffer.from(await blob.arrayBuffer()),bytes);
+ assert.equal(blob.type,'image/png');assert.equal(calls.length,2);
+ assert(calls.every(c=>c.credentials==='include'&&c.url===asset.src));
+});
+
+test('failed asset downloads are bounded, retain HTTP status and never accept an HTML error page',async()=>{
+ let calls=0;
+ const forbidden=imageDownloader(async()=>{calls++;return new Response('Forbidden',{status:403});});
+ const asset=()=>({src:'https://lh3.googleusercontent.com/gg-dl/current'});
+ await assert.rejects(forbidden(asset,new AbortController().signal,Date.now()+60_000),(e:any)=>e.message==='download_failed'&&e.download_status===403);
+ assert.equal(calls,3);
+ const html=imageDownloader(async()=>new Response('<html>login</html>',{headers:{'content-type':'text/html'}}));
+ await assert.rejects(html(asset,new AbortController().signal,Date.now()+60_000),/download_failed/);
+ const cancelled=new AbortController();cancelled.abort();
+ await assert.rejects(forbidden(asset,cancelled.signal,Date.now()+60_000),/cancelled/);assert.equal(calls,3);
+ await assert.rejects(forbidden(()=>({src:'https://unrelated.example/image'}),new AbortController().signal,Date.now()+60_000),/page_changed/);assert.equal(calls,3);
+});
+
+test('image downloads reject oversized responses before consuming their payload',async()=>{
+ const download=imageDownloader(async()=>new Response('not read',{headers:{'content-type':'image/jpeg','content-length':String(8*1024*1024+1)}}));
+ await assert.rejects(download(()=>({src:'https://lh3.googleusercontent.com/gg-dl/current'}),new AbortController().signal,Date.now()+60_000),/download_failed/);
+});

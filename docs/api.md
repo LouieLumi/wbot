@@ -50,3 +50,7 @@ WebSocket 事件包括 `message.received`、`job.updated`、`reply.failed`、`co
 代码模式新群由手机 `/signup` 事件进入后台待授权列表，`PATCH /api/admin/groups/:id` 的 `enabled` 字段完成批准或撤销。`POST /api/admin/groups` 是旧界面登记入口，不是代码模式的新群入口。`GET /api/admin/jobs` 支持分页、状态、群和范围筛选。
 
 密码登录：`POST /api/auth/login`，退出：`POST /api/auth/logout`。登录接口有独立失败限流。
+
+## Gemini 下载诊断
+
+独立本机 worker 端口上的 `POST /probe-download` 使用 `GEMINI_WEB_TOKEN` 鉴权，接收 `{ "url": "https://lh3.googleusercontent.com/gg-dl/..." }`。只接受 Google 生成图片路径，在 worker 空闲时通过现有浏览器下载该资源，返回 MIME、字节数和 SHA-256；不会提交提示词或发送微信群消息。`GET /status` 的 `worker_failure` 保留错误类型和 HTTP 状态，不包含图片地址、提示词或登录信息。

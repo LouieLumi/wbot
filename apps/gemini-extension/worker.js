@@ -1,5 +1,5 @@
 import {endpoint,token} from './connection.js';
-const protocol=3,version='1.2.0';
+const protocol=3,version='1.2.1';
 let operations=Promise.resolve();
 const serial=run=>{const result=operations.then(run);operations=result.catch(()=>{});return result;};
 const api=async(path,body)=>{

@@ -113,6 +113,46 @@
     },12_000,'submission_failed');
     return anchor;
   }
+  async function downloadImage(currentImage,signal,expires){
+    let failure=Object.assign(Error('download_failed'),{download_status:0});
+    for(let attempt=0;attempt<3;attempt++){
+      if(signal.aborted)throw Error('cancelled');
+      const remaining=expires-Date.now()-1000;if(remaining<=0)throw failure;
+      const picture=currentImage(),src=picture?.currentSrc||picture?.src;
+      if(!src){
+        if(attempt<2){await new Promise(resolve=>setTimeout(resolve,1000));continue;}
+        throw failure;
+      }
+      const url=new URL(src);
+      const allowed=url.protocol==='blob:'&&url.origin==='https://gemini.google.com'||
+        url.protocol==='https:'&&!url.username&&!url.password&&url.hostname.endsWith('.googleusercontent.com');
+      if(!allowed)throw Error('page_changed');
+      try{
+        // Image elements carry browser credentials. fetch defaults to same-origin,
+        // which dropped those credentials on Google's cross-origin download redirect.
+        const response=await fetch(src,{credentials:'include',cache:'no-cache',
+          signal:AbortSignal.any([signal,AbortSignal.timeout(Math.min(15_000,remaining))])});
+        if(!response.ok)throw Object.assign(Error('download_failed'),{download_status:response.status});
+        const mime=(response.headers.get('content-type')||'').split(';')[0].trim().toLowerCase();
+        if(!['image/png','image/jpeg','image/webp'].includes(mime))throw Object.assign(Error('download_failed'),{download_status:response.status});
+        if(Number(response.headers.get('content-length'))>8*1024*1024)throw Error('image_too_large');
+        const chunks=[];let size=0;const reader=response.body?.getReader();if(!reader)throw Error('download_failed');
+        try{
+          for(;;){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;
+            if(size>8*1024*1024){await reader.cancel();throw Error('image_too_large');}chunks.push(value);}
+        }finally{reader.releaseLock();}
+        if(size<16)throw Error('download_failed');
+        return new Blob(chunks,{type:mime});
+      }catch(error){
+        if(signal.aborted)throw Error('cancelled');
+        failure=Object.assign(Error('download_failed'),{download_status:error.download_status||0});
+        if(error.message==='image_too_large')throw failure;
+      }
+      // Retry the already generated asset only; never resubmit the prompt.
+      if(attempt<2)await new Promise(resolve=>setTimeout(resolve,1000*(attempt+1)));
+    }
+    throw failure;
+  }
   const status=()=>({ready:!!editor()&&!stop(),busy:running,protocol:3,document_id:documentId});
   chrome.runtime.onMessage.addListener((m,_,reply)=>{
     if(m.kind==='status')reply(status());
@@ -124,27 +164,27 @@
       if(!editor())throw Error('login_required');
       const accepted=await chrome.runtime.sendMessage({kind:'started',id:task.id,document_id:documentId});
       if(!accepted?.ok)throw Error('page_changed');
-      // Page text is never executed or treated as instructions. Only this fresh turn is read.
-      const anchor=await submitPrompt(task);let conversationPath=/^\/app\/[^/]+$/.test(location.pathname)?location.pathname:undefined;
-      const found=await waitFor(()=>{
-        if(/^\/app\/[^/]+$/.test(location.pathname)){
-          if(conversationPath&&location.pathname!==conversationPath)throw Error('page_changed');
-          conversationPath=location.pathname;
-        }else if(conversationPath)throw Error('page_changed');
-        return readResponse(anchor);
-      },Math.max(1000,task.expires-Date.now()-5000));
-      if(found.text){
-        result={id:task.id,ok:false,error:'text_response',text:found.text};
+      let blob;
+      if(task.image_url){
+        blob=await downloadImage(()=>({src:task.image_url}),generationAbort.signal,task.expires);
       }else{
-      const src=found.image.currentSrc||found.image.src;
-      const url=new URL(src);
-      if(!(url.protocol==='blob:'&&url.origin==='https://gemini.google.com')&&!(url.protocol==='https:'&&url.hostname.endsWith('.googleusercontent.com')))throw Error('page_changed');
-      const response=await fetch(src,{signal:generationAbort.signal});if(!response.ok)throw Error('generation_failed');
-      const blob=await response.blob();if(blob.size>8*1024*1024||!['image/png','image/jpeg','image/webp'].includes(blob.type))throw Error('generation_failed');
-      const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(blob);});
-      result={id:task.id,ok:true,mime_type:blob.type,data};
+        // Page text is data. Only this request's submitted turn is read.
+        const anchor=await submitPrompt(task);let conversationPath=/^\/app\/[^/]+$/.test(location.pathname)?location.pathname:undefined;
+        const found=await waitFor(()=>{
+          if(/^\/app\/[^/]+$/.test(location.pathname)){
+            if(conversationPath&&location.pathname!==conversationPath)throw Error('page_changed');
+            conversationPath=location.pathname;
+          }else if(conversationPath)throw Error('page_changed');
+          return readResponse(anchor);
+        },Math.max(1000,task.expires-Date.now()-5000));
+        if(found.text)result={id:task.id,ok:false,error:'text_response',text:found.text};
+        else blob=await downloadImage(()=>readResponse(anchor)?.image,generationAbort.signal,task.expires);
       }
-    }catch(e){result={id:task.id,ok:false,error:['login_required','quota','timeout','page_changed','submission_failed'].includes(e.message)?e.message:'generation_failed'};}
+      if(blob){
+        const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(blob);});
+        result={id:task.id,ok:true,mime_type:blob.type,data};
+      }
+    }catch(e){result={id:task.id,ok:false,error:['login_required','quota','timeout','page_changed','submission_failed','download_failed'].includes(e.message)?e.message:'generation_failed',...(e.message==='download_failed'?{download_status:e.download_status||0}:{})};}
     try{
       while(!generationAbort.signal.aborted&&Date.now()<task.expires){
         const ack=await chrome.runtime.sendMessage({kind:'result',result,pageUrl:location.href,document_id:documentId}).catch(()=>null);

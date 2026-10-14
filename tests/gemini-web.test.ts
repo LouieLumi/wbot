@@ -116,3 +116,37 @@ test('the session protocol gates older extensions and propagates opaque sessions
   assert.equal(images.status().extension_version,'1.2.0');
  }finally{await app.close();}
 });
+
+test('a generated image download failure preserves its stage and HTTP status without another generation',async()=>{
+ const images=new GeminiWebImages(),app=createGeminiWorker(config,images);images.heartbeat(true);
+ try{
+  const pending=images.generate('test',new AbortController().signal),task=images.claim(true)!;
+  const rejected=assert.rejects(pending,(e:any)=>e.reason==='image_download_failed'&&e.httpStatus===403&&imageErrorReply(e).includes('图片已经生成'));
+  const result={id:task.id,ok:false,error:'download_failed',download_status:403};
+  assert.equal((await app.inject({method:'POST',url:'/result',headers,payload:result})).statusCode,200);
+  await rejected;assert.equal(images.status().worker_failure?.error,'download_failed');assert.equal(images.status().worker_failure?.http_status,403);
+  assert.equal(images.claim(true),null);
+  assert.equal((await app.inject({method:'POST',url:'/result',headers,payload:result})).statusCode,409);
+ }finally{await app.close();}
+});
+
+test('download diagnosis is authenticated, restricted to generated assets and returns metadata only',async()=>{
+ const images=new GeminiWebImages(2000,1000),app=createGeminiWorker(config,images);images.heartbeat(true);
+ try{
+  assert.equal((await app.inject({method:'POST',url:'/probe-download',headers:{host:headers.host},payload:{url:'https://lh3.googleusercontent.com/gg-dl/asset'}})).statusCode,401);
+  for(const url of ['http://127.0.0.1/private','https://unrelated.example/image','https://lh3.googleusercontent.com/profile/photo']){
+   assert.equal((await app.inject({method:'POST',url:'/probe-download',headers,payload:{url}})).statusCode,400);
+  }
+  for(const version of ['1.2.0','1.1.9','invalid']){
+   images.extension(version);
+   assert.equal((await app.inject({method:'POST',url:'/probe-download',headers,payload:{url:'https://lh3.googleusercontent.com/gg-dl/asset'}})).statusCode,503);
+   assert.equal(images.status().pending,0);
+  }
+  images.extension('1.2.1');
+  const response=app.inject({method:'POST',url:'/probe-download',headers,payload:{url:'https://lh3.googleusercontent.com/gg-dl/asset'}}).then(r=>r);
+  for(let i=0;i<50&&!images.status().pending;i++)await new Promise(resolve=>setTimeout(resolve,5));
+  const task=images.claim(true)!;assert.equal(task.image_url,'https://lh3.googleusercontent.com/gg-dl/asset');
+  images.complete(task.id,{mime_type:'image/png',data:png});
+  const result=(await response).json();assert.equal(result.ok,true);assert.equal(result.bytes,png.length);assert.equal(result.data,undefined);
+ }finally{await app.close();}
+});

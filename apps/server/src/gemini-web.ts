@@ -1,11 +1,11 @@
 import Fastify from 'fastify';
-import {randomUUID,timingSafeEqual} from 'node:crypto';
+import {randomUUID,timingSafeEqual,createHash} from 'node:crypto';
 import {z} from 'zod';
 import type {Config} from './config.js';
 import type {GeneratedImage} from '../../../packages/shared/types.js';
 import {ImageGenerationError,ImageTextResponse,validateImage,type ImageGenerator,maxImageBytes} from './images.js';
 
-type Task={id:string;prompt:string;session_id:string;expires:number;claimed:boolean;ready:()=>void;finish:(image?:GeneratedImage,error?:Error)=>void};
+type Task={id:string;prompt:string;image_url?:string;session_id:string;expires:number;claimed:boolean;ready:()=>void;finish:(image?:GeneratedImage,error?:Error)=>void};
 /** A narrow image-only worker channel. Browser credentials never leave Chrome. */
 export class GeminiWebImages implements ImageGenerator {
   private tasks=new Map<string,Task>();
@@ -14,9 +14,11 @@ export class GeminiWebImages implements ImageGenerator {
   private lastError:string|null=null;
   private extensionVersion:string|null=null;
   private phase:string|null=null;
+  private workerFailure:{error:string;http_status:number;at:number}|null=null;
   constructor(private timeoutMs=240_000,private connectTimeoutMs=45_000){}
-  status(){return {provider:'gemini_web',connected:this.ready&&Date.now()-this.seen<90_000,last_seen:this.seen||null,pending:this.tasks.size,last_error:this.lastError,extension_version:this.extensionVersion,phase:this.phase};}
+  status(){return {provider:'gemini_web',connected:this.ready&&Date.now()-this.seen<90_000,last_seen:this.seen||null,pending:this.tasks.size,last_error:this.lastError,extension_version:this.extensionVersion,phase:this.phase,worker_failure:this.workerFailure};}
   extension(version?:string,phase?:string){this.extensionVersion=version??null;this.phase=phase??null;}
+  failure(error:string,httpStatus=0){this.workerFailure={error,http_status:httpStatus,at:Date.now()};}
   active(id:string){return this.tasks.has(id);}
   heartbeat(ready:boolean){this.seen=Date.now();this.ready=ready;if(ready)for(const task of this.tasks.values())task.ready();}
   claim(ready:boolean){
@@ -24,14 +26,14 @@ export class GeminiWebImages implements ImageGenerator {
     if(!ready||[...this.tasks.values()].some(t=>t.claimed))return null;
     const task=this.tasks.values().next().value as Task|undefined;
     if(!task)return null;
-    task.claimed=true;return {id:task.id,prompt:task.prompt,session_id:task.session_id,expires:task.expires};
+    task.claimed=true;return {id:task.id,prompt:task.prompt,session_id:task.session_id,expires:task.expires,...(task.image_url?{image_url:task.image_url}:{})};
   }
   complete(id:string,image?:GeneratedImage,error?:Error){
     const task=this.tasks.get(id);if(!task?.claimed)return false;
     if(image)validateImage(image.data,image.mime_type);
     task.finish(image,error);return true;
   }
-  generate(prompt:string,signal:AbortSignal,sessionId=randomUUID()):Promise<GeneratedImage>{
+  generate(prompt:string,signal:AbortSignal,sessionId=randomUUID(),imageUrl?:string):Promise<GeneratedImage>{
     if(!prompt.trim())return Promise.reject(new Error('invalid_image_prompt'));
     if(signal.aborted)return Promise.reject(new Error('image_cancelled'));
     if(this.tasks.size>=10)return Promise.reject(new ImageGenerationError('image_rate_limited',429));
@@ -48,7 +50,7 @@ export class GeminiWebImages implements ImageGenerator {
       // An extension restart/navigation briefly reports ready:false. Keep the request
       // until its first ready heartbeat instead of rejecting a recoverable transition.
       const connectionTimer=this.status().connected?undefined:setTimeout(()=>finish(undefined,new ImageGenerationError('image_browser_offline',503)),this.connectTimeoutMs);
-      this.tasks.set(id,{id,prompt,session_id:sessionId,expires,claimed:false,ready:()=>clearTimeout(connectionTimer),finish});
+      this.tasks.set(id,{id,prompt,...(imageUrl?{image_url:imageUrl}:{}),session_id:sessionId,expires,claimed:false,ready:()=>clearTimeout(connectionTimer),finish});
       signal.addEventListener('abort',cancel,{once:true});
     });
   }
@@ -69,6 +71,24 @@ export function createGeminiWorker(config:Config,images:GeminiWebImages){
   });
   app.setErrorHandler((e,_,res)=>res.code(e instanceof z.ZodError?400:503).send({error:'invalid_worker_request'}));
   app.get('/status',async()=>images.status());
+  // Authenticated local diagnostic: fetch an existing Gemini asset, never generate
+  // another image or send anything to WeChat. Only bounded metadata is returned.
+  app.post('/probe-download',async req=>{
+    const {url}=z.object({url:z.string().url().max(8192).refine(value=>{
+      const parsed=new URL(value);return parsed.protocol==='https:'&&parsed.hostname==='lh3.googleusercontent.com'&&
+        !parsed.port&&!parsed.username&&!parsed.password&&/^\/(?:gg-dl|rd-gg-dl)\//.test(parsed.pathname);
+    })}).strict().parse(req.body);
+    const state=images.status(),version=state.extension_version?.match(/^(\d+)\.(\d+)\.(\d+)$/)?.slice(1).map(Number);
+    const [major=0,minor=0,patch=0]=version??[];
+    // Older workers would interpret a download task as a new image prompt.
+    if(!state.connected||!version||!(major>1||major===1&&(minor>2||minor===2&&patch>=1)))throw Error('worker_upgrade_required');
+    if(state.pending)throw Error('worker_busy');
+    const abort=new AbortController(),cancel=()=>abort.abort();req.raw.on('aborted',cancel);
+    try{
+      const image=await images.generate('Download diagnostic',abort.signal,randomUUID(),url);
+      return {ok:true,mime_type:image.mime_type,bytes:image.data.length,sha256:createHash('sha256').update(image.data).digest('hex')};
+    }finally{req.raw.off('aborted',cancel);}
+  });
   const heartbeat=z.object({ready:z.boolean(),protocol:z.number().int().optional(),phase:z.enum(['loading','dispatching','generating']).optional(),version:z.string().max(32).optional(),task_id:z.string().uuid().optional()}).strict();
   app.post('/heartbeat',async req=>{
     const value=heartbeat.parse(req.body);images.extension(value.version,value.phase);images.heartbeat(value.ready&&value.protocol===3);
@@ -83,15 +103,17 @@ export function createGeminiWorker(config:Config,images:GeminiWebImages){
     const value=z.union([
       z.object({id:z.string().uuid(),ok:z.literal(true),mime_type:z.enum(['image/png','image/jpeg','image/webp']),data:z.string().max(Math.ceil(maxImageBytes/3)*4).regex(/^[A-Za-z0-9+/]+={0,2}$/)}).strict(),
       z.object({id:z.string().uuid(),ok:z.literal(false),error:z.literal('text_response'),text:z.string().trim().min(1).max(2000)}).strict(),
+      z.object({id:z.string().uuid(),ok:z.literal(false),error:z.literal('download_failed'),download_status:z.number().int().min(0).max(599)}).strict(),
       z.object({id:z.string().uuid(),ok:z.literal(false),error:z.enum(['login_required','quota','timeout','page_changed','browser_restarted','generation_failed','submission_failed'])}).strict()
     ]).parse(req.body);
     if(!value.ok&&value.error==='text_response'){
       const accepted=images.complete(value.id,undefined,new ImageTextResponse(value.text));
       return accepted?{ok:true}:res.code(409).send({error:'task_expired'});
     }
+    if(!value.ok&&images.active(value.id))images.failure(value.error,'download_status' in value?value.download_status:0);
     const image=value.ok?{mime_type:value.mime_type,data:Buffer.from(value.data,'base64')}:undefined;
-    const reason=!value.ok&&value.error==='quota'?'image_quota_exhausted':!value.ok&&value.error==='login_required'?'image_browser_offline':!value.ok&&value.error==='timeout'?'image_browser_timeout':!value.ok&&value.error==='submission_failed'?'image_submission_failed':'image_service_unavailable';
-    const accepted=images.complete(value.id,image,value.ok?undefined:new ImageGenerationError(reason,value.error==='quota'?429:503));
+    const reason=!value.ok&&value.error==='download_failed'?'image_download_failed':!value.ok&&value.error==='quota'?'image_quota_exhausted':!value.ok&&value.error==='login_required'?'image_browser_offline':!value.ok&&value.error==='timeout'?'image_browser_timeout':!value.ok&&value.error==='submission_failed'?'image_submission_failed':'image_service_unavailable';
+    const accepted=images.complete(value.id,image,value.ok?undefined:new ImageGenerationError(reason,value.error==='quota'?429:'download_status' in value&&value.download_status?value.download_status:503));
     return accepted?{ok:true}:res.code(409).send({error:'task_expired'});
   });
   app.addHook('onClose',async()=>images.close());return app;
