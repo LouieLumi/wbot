@@ -1,0 +1,33 @@
+{
+  "name": "wbot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "tsx --env-file-if-exists=.env apps/server/src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node --env-file-if-exists=.env dist/apps/server/src/main.js",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "npm run build && npm test",
+    "device:probe": ".runtime/venv/bin/python scripts/device-agent.py probe",
+    "admin": "node --env-file=.env scripts/open-admin.mjs",
+    "setup": "node scripts/init-env.mjs"
+  },
+  "dependencies": {
+    "fastify": "^5.6.0",
+    "@fastify/websocket": "^11.2.0",
+    "@fastify/rate-limit": "^10.3.0",
+    "zod": "^4.1.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "tsx": "^4.20.5",
+    "@types/node": "^22.18.0",
+    "@types/ws": "^8.18.1"
+  },
+  "description": "Local WeChat group bot bridge with member memory, admin console and Gemini image sessions"
+}

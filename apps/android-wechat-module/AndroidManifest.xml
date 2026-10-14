@@ -1,0 +1,8 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="local.nilabot.wechathook" android:versionCode="1" android:versionName="0.1-diagnostic">
+  <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="29" />
+  <application android:label="Nila 微信代码接口诊断" android:allowBackup="false">
+    <meta-data android:name="xposedmodule" android:value="true" />
+    <meta-data android:name="xposeddescription" android:value="微信 8.0.79 本机文字桥接测试：密钥认证，只允许指定群聊" />
+    <meta-data android:name="xposedminversion" android:value="82" />
+  </application>
+</manifest>

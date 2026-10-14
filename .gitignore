@@ -1,0 +1,39 @@
+# Local configuration, credentials, conversations and downloaded dependencies
+.env
+.env.*
+!.env.example
+.runtime/
+runtime/
+data/
+config/wechat-profile.json
+apps/gemini-extension/connection.js
+
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+.gradle/
+**/build/
+
+# Device packages, signing keys, databases, archives and generated images
+*.apk
+*.aab
+*.dex
+*.jks
+*.keystore
+*.pem
+*.key
+*.sqlite*
+*.db
+*.db-*
+*.har
+*.zip
+*.tar.gz
+
+# Machine-specific one-off upgrade/recovery procedures (kept locally)
+/scripts/deploy-*.py
+/scripts/test-hermes-search.py

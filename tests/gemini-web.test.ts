@@ -1,0 +1,118 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {GeminiWebImages,createGeminiWorker} from '../apps/server/src/gemini-web.js';
+import {readConfig} from '../apps/server/src/config.js';
+import {imageErrorReply} from '../apps/server/src/images.js';
+const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=','base64');
+const config=readConfig({BRIDGE_API_TOKEN:'b'.repeat(64),GEMINI_WEB_TOKEN:'a'.repeat(64),GEMINI_WEB_EXTENSION_ID:'a'.repeat(32),IMAGE_PROVIDER:'gemini_web'});
+const headers={host:'127.0.0.1:3152',authorization:'Bearer '+config.GEMINI_WEB_TOKEN,origin:'chrome-extension://'+config.GEMINI_WEB_EXTENSION_ID};
+test('an unconfirmed browser submission is reported distinctly and late results are rejected',async()=>{
+ const images=new GeminiWebImages(),app=createGeminiWorker(config,images);images.heartbeat(true);
+ try{
+  const pending=images.generate('test',new AbortController().signal),task=images.claim(true)!;
+  const outcome=assert.rejects(pending,e=>imageErrorReply(e).includes('未能确认 Gemini 已接收'));
+  const result={id:task.id,ok:false,error:'submission_failed'};
+  assert.equal((await app.inject({method:'POST',url:'/result',headers,payload:result})).statusCode,200);
+  await outcome;assert.equal(images.status().last_error,'image_submission_failed');
+  assert.equal((await app.inject({method:'POST',url:'/result',headers,payload:{id:task.id,ok:true,mime_type:'image/png',data:png.toString('base64')}})).statusCode,409);
+ }finally{await app.close();}
+});
+test('web image worker preserves long prompts including newlines, emoji and the final instructions',async()=>{
+ const images=new GeminiWebImages(),app=createGeminiWorker(config,images);
+ const prompt='第一段：\n'+('细节要求🌙\n'.repeat(1000))+'结尾要求不得丢失';
+ try{
+  images.heartbeat(true);const pending=images.generate(prompt,new AbortController().signal);
+  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:2}})).json().task;
+  assert.equal(task.prompt,prompt);assert(task.prompt.length>5000);
+  await app.inject({method:'POST',url:'/result',headers,payload:{id:task.id,ok:true,mime_type:'image/png',data:png.toString('base64')}});
+  assert.deepEqual(Buffer.from((await pending).data),png);
+ }finally{await app.close();}
+});
+test('web worker authenticates a narrow extension channel, claims once, validates image and rejects duplicate delivery',async()=>{
+ const images=new GeminiWebImages(),app=createGeminiWorker(config,images);
+ try{
+  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{host:headers.host},payload:{ready:true,protocol:2}})).statusCode,401);
+  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{...headers,origin:'https://gemini.google.com'},payload:{ready:true,protocol:2}})).statusCode,403);
+  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{...headers,host:'evil.example'},payload:{ready:true,protocol:2}})).statusCode,403);
+  await app.inject({method:'POST',url:'/heartbeat',headers,payload:{ready:true,protocol:2}});
+  const pending=images.generate('白猫',new AbortController().signal);
+  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:2}})).json().task;
+  assert.equal(task.prompt,'白猫');
+  assert.equal((await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:2}})).json().task,null);
+  const invalid=await app.inject({method:'POST',url:'/result',headers,payload:{id:task.id,ok:true,mime_type:'image/png',data:Buffer.from('invalid image body text').toString('base64')}});
+  assert.equal(invalid.statusCode,503);assert.equal(images.status().pending,1);
+  const result={id:task.id,ok:true,mime_type:'image/png',data:png.toString('base64')};
+  assert.equal((await app.inject({method:'POST',url:'/result',headers,payload:result})).statusCode,200);
+  assert.deepEqual(Buffer.from((await pending).data),png);
+  assert.equal((await app.inject({method:'POST',url:'/result',headers,payload:result})).statusCode,409);
+ }finally{await app.close();}
+});
+test('completed text is returned verbatim, bounded and only for the claimed task',async()=>{
+ const images=new GeminiWebImages(),app=createGeminiWorker(config,images);images.heartbeat(true);
+ try{
+  const pending=images.generate('test',new AbortController().signal),task=images.claim(true)!;
+  const text='我暂时无法生成这张图片。\n可以换一个主题。';
+  const result={id:task.id,ok:false,error:'text_response',text};
+  assert.equal((await app.inject({method:'POST',url:'/result',headers,payload:{...result,text:' '.repeat(5)}})).statusCode,400);
+  assert.equal((await app.inject({method:'POST',url:'/result',headers,payload:{...result,text:'字'.repeat(2001)}})).statusCode,400);
+  const outcome=assert.rejects(pending,e=>imageErrorReply(e)===text);
+  assert.equal((await app.inject({method:'POST',url:'/result',headers,payload:result})).statusCode,200);
+  await outcome;
+  assert.equal((await app.inject({method:'POST',url:'/result',headers,payload:result})).statusCode,409);
+  assert.equal(images.status().pending,0);
+ }finally{await app.close();}
+});
+test('cancelled or expired web generation cannot deliver late images; disconnected browser has a bounded grace period',async()=>{
+ const images=new GeminiWebImages(60,10),signal=new AbortController();
+ await assert.rejects(images.generate('cat',signal.signal),e=>imageErrorReply(e).includes('未连接'));
+ images.heartbeat(true);const cancelled=images.generate('cat',signal.signal);const task=images.claim(true)!;
+ signal.abort();await assert.rejects(cancelled,/image_cancelled/);
+ assert.equal(images.complete(task.id,{mime_type:'image/png',data:png}),false);
+ await assert.rejects(images.generate('cat',new AbortController().signal),e=>imageErrorReply(e).includes('超时'));
+ assert.equal(images.status().pending,0);
+});
+test('a request received while the browser is reconnecting waits and is delivered only once after readiness',async()=>{
+ const images=new GeminiWebImages(1000,50),signal=new AbortController();
+ images.heartbeat(false);
+ const pending=images.generate('画一个苹果',signal.signal);
+ assert.equal(images.status().pending,1);assert.equal(images.claim(false),null);
+ images.heartbeat(true);
+ const task=images.claim(true)!;assert.equal(task.prompt,'画一个苹果');
+ images.complete(task.id,{mime_type:'image/png',data:png});
+ assert.deepEqual(Buffer.from((await pending).data),png);
+ assert.equal(images.complete(task.id,{mime_type:'image/png',data:png}),false);
+ const waiting=new GeminiWebImages(1000,50),cancelled=waiting.generate('cat',signal.signal);
+ signal.abort();await assert.rejects(cancelled,/image_cancelled/);
+ waiting.heartbeat(true);assert.equal(waiting.claim(true),null);
+});
+test('multiple groups are serialized and quota failures do not retry or expose page text',async()=>{
+ const images=new GeminiWebImages();images.heartbeat(true);
+ const one=images.generate('first',new AbortController().signal),two=images.generate('second',new AbortController().signal);
+ const first=images.claim(true)!;assert.equal(first.prompt,'first');assert.equal(images.claim(true),null);
+ images.complete(first.id,{mime_type:'image/png',data:png});await one;
+ const second=images.claim(true)!;assert.equal(second.prompt,'second');
+ const app=createGeminiWorker(config,images);
+ try{
+  await app.inject({method:'POST',url:'/result',headers,payload:{id:second.id,ok:false,error:'quota'}});
+  await assert.rejects(two,e=>imageErrorReply(e).includes('额度已用完'));
+  assert.equal(images.claim(true),null);
+ }finally{await app.close();}
+});
+
+test('the session protocol gates older extensions and propagates opaque sessions and cancellation',async()=>{
+ const images=new GeminiWebImages(),app=createGeminiWorker(config,images),signal=new AbortController();
+ try{
+  const session='ea216de1-e0dc-4b2c-8dfc-bbe5b7361ea0';images.heartbeat(true);
+  const pending=images.generate('same user',signal.signal,session);
+  const outcome=assert.rejects(pending,/image_cancelled/);
+  const old=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true}})).json();
+  assert.equal(old.task,null);assert.equal(old.upgrade_required,true);
+  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:2,version:'1.1.0'}})).json().task;
+  assert.equal(task.session_id,session);assert.equal(task.chat_id,undefined);assert.equal(task.member_id,undefined);
+  const beat={ready:true,protocol:2,version:'1.1.0',task_id:task.id};
+  assert.equal((await app.inject({method:'POST',url:'/heartbeat',headers,payload:beat})).json().task_active,true);
+  signal.abort();await outcome;
+  assert.equal((await app.inject({method:'POST',url:'/heartbeat',headers,payload:beat})).json().task_active,false);
+  assert.equal(images.status().extension_version,'1.1.0');
+ }finally{await app.close();}
+});
