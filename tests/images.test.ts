@@ -210,7 +210,8 @@ test('/newimg cancels only its sender old images, preserves text memory and rout
   assert.equal(s.bridge.memory.member(group.id,alice.id)!.notes,'我的文字笔记');
   assert.equal(s.store.db.prepare("SELECT count(*) AS n FROM jobs WHERE content LIKE '已切换到你的新生图对话%'").get()!.n,1);
   const imagePrompts=s.store.db.prepare('SELECT content FROM jobs WHERE id IN (SELECT job_id FROM job_images)').all().map(j=>j.content);
-  assert.deepEqual(imagePrompts,['[图片] Bob','[图片] fresh']);
+  // Membership is checked here; generation order is asserted by calls above.
+  assert.deepEqual(imagePrompts.sort(),['[图片] Bob','[图片] fresh']);
   assert.equal(s.store.db.prepare("SELECT count(*) AS n FROM jobs WHERE reason='image_session_reset'").get()!.n,2);
  }finally{await s.close();}
 });
