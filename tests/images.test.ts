@@ -231,3 +231,37 @@ test('/newimg also invalidates a generated image waiting for delivery without af
   assert.equal(s.store.db.prepare("SELECT state FROM jobs WHERE content='[图片] Bob'").get()!.state,'sent');
  }finally{await s.close();}
 });
+
+
+test('queued prompts survive a restart intact and run FIFO only when their turn arrives',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'wbot-image-queue-')),path=join(dir,'db'),calls:string[]=[];
+ let started!:()=>void;const ready=new Promise<void>(resolve=>started=resolve);
+ let s=setup(async(prompt,signal)=>{calls.push(prompt);started();return new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>reject(Error('cancelled')),{once:true}));},undefined,path);
+ const longPrompt='Bob 的完整提示词🌙\n'.repeat(1000)+'最后一行';
+ try{
+  await s.bridge.groups();s.bridge.receive(message('/img running'));await ready;
+  const bob={...message('/img '+longPrompt),sender:'Bob',sender_wxid:'wxid_bob'};
+  const alice=message('/img Alice-next');s.bridge.receive(bob);s.bridge.receive(alice);
+  assert.deepEqual(calls,['running']);assert.deepEqual(s.bridge.imageQueue.waiting().map(r=>r.prompt),[longPrompt,'Alice-next']);
+  await s.close();s=setup(async prompt=>{calls.push(prompt);return image;},undefined,path);
+  await s.bridge.groups();await s.bridge.repliesIdle();s.bridge.receive(bob);s.bridge.receive(alice);await s.bridge.repliesIdle();
+  assert.deepEqual(calls,['running',longPrompt,'Alice-next']);
+  assert.equal(s.store.db.prepare("SELECT count(*) AS n FROM image_requests WHERE state='uncertain'").get()!.n,1);
+  assert.equal(s.store.db.prepare("SELECT count(*) AS n FROM image_requests WHERE state='completed'").get()!.n,2);
+  assert.equal(s.bridge.imageQueue.count(),0);
+ }finally{await s.close();rmSync(dir,{recursive:true});}
+});
+
+test('restoring a queued prompt rechecks member revision and never sends an old session',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'wbot-image-stale-')),path=join(dir,'db');let calls=0;
+ let s=setup(async()=>{calls++;return image;},undefined,path);
+ try{
+  await s.bridge.groups();const member=s.bridge.memory.identifyWechat(group.id,'wxid_alice','Alice');
+  const session=s.bridge.memory.imageSession(group.id,member.id);
+  s.bridge.imageQueue.add({id:'persisted',chat_id:group.id,member_id:member.id,revision:member.revision,session_id:session,prompt:'old prompt'});
+  s.bridge.memory.reset(group.id,member.id);
+  await s.close();s=setup(async()=>{calls++;return image;},undefined,path);
+  await s.bridge.groups();await s.bridge.repliesIdle();
+  assert.equal(calls,0);assert.equal(s.bridge.imageQueue.get('persisted')!.state,'cancelled');
+ }finally{await s.close();rmSync(dir,{recursive:true});}
+});

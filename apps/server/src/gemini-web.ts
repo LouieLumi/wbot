@@ -13,9 +13,10 @@ export class GeminiWebImages implements ImageGenerator {
   private ready=false;
   private lastError:string|null=null;
   private extensionVersion:string|null=null;
+  private phase:string|null=null;
   constructor(private timeoutMs=240_000,private connectTimeoutMs=45_000){}
-  status(){return {provider:'gemini_web',connected:this.ready&&Date.now()-this.seen<90_000,last_seen:this.seen||null,pending:this.tasks.size,last_error:this.lastError,extension_version:this.extensionVersion};}
-  extension(version?:string){this.extensionVersion=version??null;}
+  status(){return {provider:'gemini_web',connected:this.ready&&Date.now()-this.seen<90_000,last_seen:this.seen||null,pending:this.tasks.size,last_error:this.lastError,extension_version:this.extensionVersion,phase:this.phase};}
+  extension(version?:string,phase?:string){this.extensionVersion=version??null;this.phase=phase??null;}
   active(id:string){return this.tasks.has(id);}
   heartbeat(ready:boolean){this.seen=Date.now();this.ready=ready;if(ready)for(const task of this.tasks.values())task.ready();}
   claim(ready:boolean){
@@ -68,14 +69,14 @@ export function createGeminiWorker(config:Config,images:GeminiWebImages){
   });
   app.setErrorHandler((e,_,res)=>res.code(e instanceof z.ZodError?400:503).send({error:'invalid_worker_request'}));
   app.get('/status',async()=>images.status());
-  const heartbeat=z.object({ready:z.boolean(),protocol:z.literal(2).optional(),version:z.string().max(32).optional(),task_id:z.string().uuid().optional()}).strict();
+  const heartbeat=z.object({ready:z.boolean(),protocol:z.number().int().optional(),phase:z.enum(['loading','dispatching','generating']).optional(),version:z.string().max(32).optional(),task_id:z.string().uuid().optional()}).strict();
   app.post('/heartbeat',async req=>{
-    const value=heartbeat.parse(req.body);images.extension(value.version);images.heartbeat(value.ready&&value.protocol===2);
-    return {ok:true,...(value.task_id?{task_active:images.active(value.task_id)}:{}),upgrade_required:value.protocol!==2};
+    const value=heartbeat.parse(req.body);images.extension(value.version,value.phase);images.heartbeat(value.ready&&value.protocol===3);
+    return {ok:true,...(value.task_id?{task_active:images.active(value.task_id)}:{}),upgrade_required:value.protocol!==3};
   });
   app.post('/claim',async req=>{
-    const value=heartbeat.parse(req.body);images.extension(value.version);
-    if(value.protocol!==2){images.heartbeat(false);return {task:null,upgrade_required:true};}
+    const value=heartbeat.parse(req.body);images.extension(value.version,value.phase);
+    if(value.protocol!==3){images.heartbeat(false);return {task:null,upgrade_required:true};}
     return {task:images.claim(value.ready)};
   });
   app.post('/result',async(req,res)=>{

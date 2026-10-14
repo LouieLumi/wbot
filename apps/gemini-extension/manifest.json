@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nila · Gemini 网页生图",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "将 Nila 的图片任务发送到专用 Gemini 标签页。",
   "permissions": ["storage", "alarms"],
   "host_permissions": ["http://127.0.0.1/*", "https://gemini.google.com/*"],

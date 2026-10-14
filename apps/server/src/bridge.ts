@@ -10,6 +10,7 @@ import {command} from './commands.js';
 import {hostLocked} from './power.js';
 import {GeminiImages,ImageGenerationError,imageErrorReply,type ImageGenerator} from './images.js';
 import {WechatAdmin} from './wechat-admin.js';
+import {ImageQueue,type ImageRequest} from './image-queue.js';
 
 export class WindowTracker {
   private previous:Snapshot|null=null;
@@ -34,15 +35,16 @@ export class Bridge extends EventEmitter {
   private imageRequests=new Map<string,{member:Member;session:string;controller:AbortController}>();
   private commandChain:Promise<void>=Promise.resolve();private pendingCommands=0;private lastCommand=new Map<string,number>();
   readonly wechatAdmin:WechatAdmin;
+  readonly imageQueue:ImageQueue;private imageQueueRecovered=false;
   private lastReply=new Map<string,number>();private abort=new AbortController();private closed=false;
   paused:boolean;autoReply:boolean;lastReliability='not_started';lastError:string|null=null;activeChat:string|null=null;
   constructor(readonly config:Config,readonly driver:DeviceAdapter,readonly store:Store,private responder:Responder,
     readonly memory=new Memories(store),readonly models=new Models(config,store),private images:ImageGenerator=new GeminiImages(config)){
-    super();this.wechatAdmin=new WechatAdmin(config,store);this.paused=store.get('paused')!=='false';this.autoReply=store.get('auto_reply')?store.get('auto_reply')==='true':config.WECHAT_AUTO_REPLY;
+    super();this.imageQueue=new ImageQueue(store);this.wechatAdmin=new WechatAdmin(config,store);this.paused=store.get('paused')!=='false';this.autoReply=store.get('auto_reply')?store.get('auto_reply')==='true':config.WECHAT_AUTO_REPLY;
   }
   emitEvent(event:Record<string,unknown>){this.emit('event',event);}
   get deviceBusy(){return this.busy;}
-  imageStatus(){return this.images.status?.()??{provider:'proxy',model:this.config.IMAGE_MODEL};}
+  imageStatus(){return {...(this.images.status?.()??{provider:'proxy',model:this.config.IMAGE_MODEL}) as object,queue:this.imageQueue.status()};}
   async deviceIdle(){while(this.busy)await new Promise(r=>setTimeout(r,25));}
   control(paused:boolean,autoReply?:boolean){
     if(paused||autoReply===false){this.abort.abort();this.abort=new AbortController();}
@@ -56,6 +58,10 @@ export class Bridge extends EventEmitter {
     const groups=this.memory.groups();
     await this.driver.setAuthorized?.(groups.filter(g=>g.enabled&&g.verified).map(g=>g.id));
     await this.wechatAdmin.resolve(this.driver);
+    if(!this.imageQueueRecovered&&!this.paused&&this.autoReply){
+      this.imageQueueRecovered=true;
+      for(const request of this.imageQueue.waiting())this.scheduleImage(request);
+    }
     return groups;
   }
   async groupPatch(id:string,patch:{enabled?:boolean;model?:string;paused?:boolean}){
@@ -235,33 +241,58 @@ export class Bridge extends EventEmitter {
   }
   private cancelStaleImages(){for(const task of this.imageRequests.values())if(!this.imageCurrent(task.member,task.session))task.controller.abort();}
   private queueImage(message:Message,member:Member,prompt:string){
-    if(!this.store.once(message.message_id))return;
-    if(this.imageRequests.size>=10){this.store.enqueue(message.chat_id,member.name+'，生图队列已满，请稍后重试。','error:'+message.message_id);return;}
-    const session=this.memory.imageSession(member.chat_id,member.id),controller=new AbortController();
-    const signal=AbortSignal.any([this.abort.signal,controller.signal]);
-    const progress=this.store.enqueue(message.chat_id,member.name+(this.imageRequests.size?'，已加入生图队列。':'，正在生成图片，请稍候。'),'progress:'+message.message_id);
-    this.memory.trackImageJob(progress.id,member,session);
-    this.imageRequests.set(message.message_id,{member,session,controller});
+    this.store.db.exec('BEGIN IMMEDIATE');
+    try{
+      if(!this.store.once(message.message_id)){this.store.db.exec('COMMIT');return;}
+      const ahead=this.imageQueue.count();
+      if(ahead>=10){this.store.enqueue(message.chat_id,member.name+'，生图队列已满，请稍后重试。','error:'+message.message_id);this.store.db.exec('COMMIT');return;}
+      const session=this.memory.imageSession(member.chat_id,member.id);
+      this.imageQueue.add({id:message.message_id,chat_id:member.chat_id,member_id:member.id,revision:member.revision,session_id:session,prompt});
+      const progress=this.store.enqueue(message.chat_id,member.name+(ahead?'，提示词已保存，前面还有 '+ahead+' 个任务。':'，正在生成图片，请稍候。'),'progress:'+message.message_id);
+      this.memory.trackImageJob(progress.id,member,session);
+      this.store.db.exec('COMMIT');
+    }catch(error){this.store.db.exec('ROLLBACK');throw error;}
+    this.scheduleImage(this.imageQueue.get(message.message_id)!);
+  }
+  private scheduleImage(request:ImageRequest){
+    if(this.imageRequests.has(request.id))return;
+    const member=this.memory.member(request.chat_id,request.member_id),session=request.session_id;
+    if(!member||member.revision!==request.revision||!this.imageCurrent(member,session)){
+      this.imageQueue.update(request.id,'cancelled','authorization_or_session_changed');return;
+    }
+    const controller=new AbortController(),signal=AbortSignal.any([this.abort.signal,controller.signal]);
+    this.imageRequests.set(request.id,{member,session,controller});
     this.imageChain=this.imageChain.then(async()=>{
-      if(signal.aborted||!this.imageCurrent(member,session))return;
+      // On shutdown, prompts which never reached the browser remain recoverable.
+      if(this.closed)return;
+      if(signal.aborted||!this.imageCurrent(member,session)){this.imageQueue.update(request.id,'cancelled','authorization_or_session_changed');return;}
+      const saved=this.imageQueue.get(request.id);if(saved?.state!=='queued')return;
+      const prompt=saved.prompt;this.imageQueue.update(request.id,'running');
       try{
         if(!this.driver.sendImage)throw new Error('image_transport_unavailable');
         const image=await this.images.generate(prompt,signal,session);
         if(signal.aborted||!this.imageCurrent(member,session))return;
-        await this.allowedChat(message.chat_id);
+        await this.allowedChat(request.chat_id);
         if(signal.aborted||!this.imageCurrent(member,session))return;
-        this.store.enqueueImage(message.chat_id,prompt,image,'reply:'+message.message_id,job=>{
+        this.store.enqueueImage(request.chat_id,prompt,image,'reply:'+request.id,job=>{
           this.memory.stage(job.id,member,'/img '+prompt,'[已生成图片]');this.memory.trackImageJob(job.id,member,session);
+          this.imageQueue.update(request.id,'completed');
         });
       }catch(e){
         if(signal.aborted||!this.imageCurrent(member,session))return;
         const reason=e instanceof ImageGenerationError?e.reason:'image_generation_failed';
-        this.store.set('last_image_error',JSON.stringify({at:Date.now(),chat_id:message.chat_id,message_id:message.message_id,reason,http_status:e instanceof ImageGenerationError?e.httpStatus:undefined,retry_at:e instanceof ImageGenerationError?e.retryAt:undefined}));
-        this.emitEvent({event:'reply.failed',message_id:message.message_id,reason});
-        const job=this.store.enqueue(message.chat_id,imageErrorReply(e),'error:'+message.message_id);
-        this.memory.trackImageJob(job.id,member,session);
+        this.store.set('last_image_error',JSON.stringify({at:Date.now(),chat_id:request.chat_id,message_id:request.id,reason,http_status:e instanceof ImageGenerationError?e.httpStatus:undefined,retry_at:e instanceof ImageGenerationError?e.retryAt:undefined}));
+        this.emitEvent({event:'reply.failed',message_id:request.id,reason});
+        this.store.db.exec('BEGIN IMMEDIATE');
+        try{
+          const job=this.store.enqueue(request.chat_id,imageErrorReply(e),'error:'+request.id);
+          this.memory.trackImageJob(job.id,member,session);this.imageQueue.update(request.id,'failed',reason);
+          this.store.db.exec('COMMIT');
+        }catch(error){this.store.db.exec('ROLLBACK');throw error;}
+      }finally{
+        if(this.imageQueue.get(request.id)?.state==='running')this.imageQueue.update(request.id,this.closed?'uncertain':'cancelled',this.closed?'interrupted_during_generation':'authorization_or_session_changed');
       }
-    }).finally(()=>{this.imageRequests.delete(message.message_id);});
+    }).catch(()=>{this.imageQueue.update(request.id,'uncertain','queue_processing_failed');}).finally(()=>{this.imageRequests.delete(request.id);});
   }
   async repliesIdle(){await Promise.all([this.replyChain,this.imageChain,this.commandChain]);}
   async close(){this.closed=true;clearInterval(this.timer);this.abort.abort();await this.repliesIdle();while(this.busy)await new Promise(r=>setTimeout(r,20));await this.driver.close?.();}

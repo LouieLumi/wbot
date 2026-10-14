@@ -22,7 +22,7 @@ test('web image worker preserves long prompts including newlines, emoji and the 
  const prompt='第一段：\n'+('细节要求🌙\n'.repeat(1000))+'结尾要求不得丢失';
  try{
   images.heartbeat(true);const pending=images.generate(prompt,new AbortController().signal);
-  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:2}})).json().task;
+  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:3}})).json().task;
   assert.equal(task.prompt,prompt);assert(task.prompt.length>5000);
   await app.inject({method:'POST',url:'/result',headers,payload:{id:task.id,ok:true,mime_type:'image/png',data:png.toString('base64')}});
   assert.deepEqual(Buffer.from((await pending).data),png);
@@ -31,14 +31,14 @@ test('web image worker preserves long prompts including newlines, emoji and the 
 test('web worker authenticates a narrow extension channel, claims once, validates image and rejects duplicate delivery',async()=>{
  const images=new GeminiWebImages(),app=createGeminiWorker(config,images);
  try{
-  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{host:headers.host},payload:{ready:true,protocol:2}})).statusCode,401);
-  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{...headers,origin:'https://gemini.google.com'},payload:{ready:true,protocol:2}})).statusCode,403);
-  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{...headers,host:'evil.example'},payload:{ready:true,protocol:2}})).statusCode,403);
-  await app.inject({method:'POST',url:'/heartbeat',headers,payload:{ready:true,protocol:2}});
+  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{host:headers.host},payload:{ready:true,protocol:3}})).statusCode,401);
+  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{...headers,origin:'https://gemini.google.com'},payload:{ready:true,protocol:3}})).statusCode,403);
+  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{...headers,host:'evil.example'},payload:{ready:true,protocol:3}})).statusCode,403);
+  await app.inject({method:'POST',url:'/heartbeat',headers,payload:{ready:true,protocol:3}});
   const pending=images.generate('白猫',new AbortController().signal);
-  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:2}})).json().task;
+  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:3}})).json().task;
   assert.equal(task.prompt,'白猫');
-  assert.equal((await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:2}})).json().task,null);
+  assert.equal((await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:3}})).json().task,null);
   const invalid=await app.inject({method:'POST',url:'/result',headers,payload:{id:task.id,ok:true,mime_type:'image/png',data:Buffer.from('invalid image body text').toString('base64')}});
   assert.equal(invalid.statusCode,503);assert.equal(images.status().pending,1);
   const result={id:task.id,ok:true,mime_type:'image/png',data:png.toString('base64')};
@@ -107,12 +107,12 @@ test('the session protocol gates older extensions and propagates opaque sessions
   const outcome=assert.rejects(pending,/image_cancelled/);
   const old=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true}})).json();
   assert.equal(old.task,null);assert.equal(old.upgrade_required,true);
-  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:2,version:'1.1.0'}})).json().task;
+  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:3,version:'1.2.0'}})).json().task;
   assert.equal(task.session_id,session);assert.equal(task.chat_id,undefined);assert.equal(task.member_id,undefined);
-  const beat={ready:true,protocol:2,version:'1.1.0',task_id:task.id};
+  const beat={ready:true,protocol:3,version:'1.2.0',task_id:task.id};
   assert.equal((await app.inject({method:'POST',url:'/heartbeat',headers,payload:beat})).json().task_active,true);
   signal.abort();await outcome;
   assert.equal((await app.inject({method:'POST',url:'/heartbeat',headers,payload:beat})).json().task_active,false);
-  assert.equal(images.status().extension_version,'1.1.0');
+  assert.equal(images.status().extension_version,'1.2.0');
  }finally{await app.close();}
 });

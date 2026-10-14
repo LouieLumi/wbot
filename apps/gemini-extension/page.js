@@ -1,5 +1,6 @@
 (() => {
   let running=false,activeTask,generationAbort;
+  const documentId=Date.now().toString(36)+Math.random().toString(36).slice(2);
   const editor=()=>document.querySelector('[contenteditable="true"][role="textbox"]');
   const visible=e=>e instanceof HTMLElement&&e.getClientRects().length>0;
   const buttons=()=>[...document.querySelectorAll('button')].filter(visible);
@@ -59,7 +60,10 @@
   });
   async function submitPrompt(task){
     const expected=task.page_url?.replace('https://gemini.google.com','')||'/app#nila-image-worker-'+task.id;
-    const fresh=()=>location.pathname+location.hash===expected;
+    const [expectedPath,expectedHash]=expected.split('#');
+    // Gemini may remove our fragment during its own routing. The worker pins a
+    // new document to this task; the assigned conversation path must still match.
+    const fresh=()=>location.pathname===expectedPath&&(!location.hash||location.hash==='#'+expectedHash);
     if(!fresh())throw Error('page_changed');
     if(expected.startsWith('/app/')){
       // Gemini renders the editor before fetching a saved conversation. Do not
@@ -69,22 +73,34 @@
         return !!editor()&&!stop()&&document.querySelectorAll('user-query').length>0&&document.querySelectorAll('model-response').length>0;
       },20_000,'page_changed',300);
     }
-    const input=editor();if(!input)throw Error('login_required');
+    await waitFor(()=>{
+      if(!fresh())throw Error('page_changed');
+      return !!editor()&&!stop();
+    },20_000,'login_required',500);
+    let input=editor();if(!input)throw Error('login_required');
     const text='请生成一张图片，不要仅用文字回答，也不要拼图。图片内容：\n'+task.prompt;
     const previous=new Set(document.querySelectorAll('model-response'));
     const queries=new Set(document.querySelectorAll('user-query'));
     const queryCount=queries.size;
-    input.focus();
-    const selection=getSelection(),range=document.createRange();range.selectNodeContents(input);selection.removeAllRanges();selection.addRange(range);
-    if(!document.execCommand('insertText',false,text))throw Error('submission_failed');
-    input.dispatchEvent(new Event('input',{bubbles:true}));
-    // Quill and the page framework update asynchronously after a long insertion.
-    // Wait for the entire draft and an enabled send control to settle before clicking.
-    const submit=await waitFor(()=>{
+    const insert=()=>{
+      input.focus();
+      const selection=getSelection(),range=document.createRange();range.selectNodeContents(input);selection.removeAllRanges();selection.addRange(range);
+      if(!document.execCommand('insertText',false,text))throw Error('submission_failed');
+      input.dispatchEvent(new Event('input',{bubbles:true}));
+    };
+    insert();let repairs=0;
+    // Wait on semantic readiness, not the identity of an Angular button node.
+    // The composer can also be replaced after a saved conversation finishes loading.
+    await waitFor(()=>{
       if(!fresh()||Date.now()>=task.expires)throw Error('page_changed');
-      if(editor()!==input||promptText(editorText(input))!==promptText(text)||stop())return null;
-      return sendButton();
-    },10_000,'submission_failed',500);
+      const current=editor();
+      if(current&&current!==input){
+        if(++repairs>2||document.querySelectorAll('user-query').length!==queryCount)throw Error('submission_failed');
+        input=current;insert();return false;
+      }
+      return current===input&&promptText(editorText(input))===promptText(text)&&!stop()&&!!sendButton();
+    },20_000,'submission_failed',500);
+    const submit=sendButton();if(!submit||editor()!==input)throw Error('submission_failed');
     submit.click();
     // A click is not an acknowledgement. Require this exact prompt in a NEW user
     // turn plus a cleared composer or a new generation. Never blindly click twice.
@@ -97,7 +113,7 @@
     },12_000,'submission_failed');
     return anchor;
   }
-  const status=()=>({ready:!!editor(),busy:running,protocol:2});
+  const status=()=>({ready:!!editor()&&!stop(),busy:running,protocol:3,document_id:documentId});
   chrome.runtime.onMessage.addListener((m,_,reply)=>{
     if(m.kind==='status')reply(status());
     if(m.kind==='cancel'&&m.id===activeTask){generationAbort?.abort();stop()?.click();reply({ok:true});}
@@ -106,7 +122,8 @@
     running=true;activeTask=task.id;generationAbort=new AbortController();let result;
     try{
       if(!editor())throw Error('login_required');
-      if(!location.hash.endsWith(task.id))throw Error('page_changed');
+      const accepted=await chrome.runtime.sendMessage({kind:'started',id:task.id,document_id:documentId});
+      if(!accepted?.ok)throw Error('page_changed');
       // Page text is never executed or treated as instructions. Only this fresh turn is read.
       const anchor=await submitPrompt(task);let conversationPath=/^\/app\/[^/]+$/.test(location.pathname)?location.pathname:undefined;
       const found=await waitFor(()=>{
@@ -128,7 +145,14 @@
       result={id:task.id,ok:true,mime_type:blob.type,data};
       }
     }catch(e){result={id:task.id,ok:false,error:['login_required','quota','timeout','page_changed','submission_failed'].includes(e.message)?e.message:'generation_failed'};}
-    try{if(!generationAbort.signal.aborted)await chrome.runtime.sendMessage({kind:'result',result,pageUrl:location.href});}finally{running=false;activeTask=undefined;generationAbort=undefined;}
+    try{
+      while(!generationAbort.signal.aborted&&Date.now()<task.expires){
+        const ack=await chrome.runtime.sendMessage({kind:'result',result,pageUrl:location.href,document_id:documentId}).catch(()=>null);
+        if(ack?.ok||ack?.ignored||ack?.expired)break;
+        await new Promise(resolve=>setTimeout(resolve,2000));
+      }
+    }finally{running=false;activeTask=undefined;generationAbort=undefined;}
+    void ready();
   }
   async function ready(){
     try{const response=await chrome.runtime.sendMessage({kind:'ready',...status(),pageUrl:location.href});if(response?.task&&!running)void generate(response.task);}catch{}

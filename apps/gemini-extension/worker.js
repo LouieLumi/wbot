@@ -1,10 +1,10 @@
 import {endpoint,token} from './connection.js';
-const protocol=2,version='1.1.1';
+const protocol=3,version='1.2.0';
 let operations=Promise.resolve();
 const serial=run=>{const result=operations.then(run);operations=result.catch(()=>{});return result;};
 const api=async(path,body)=>{
   const response=await fetch(endpoint+path,{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(15_000)});
-  if(!response.ok)throw new Error('bridge_unavailable');return response.json();
+  if(!response.ok)throw Object.assign(new Error('bridge_unavailable'),{status:response.status});return response.json();
 };
 const conversation=url=>typeof url==='string'&&/^https:\/\/gemini\.google\.com\/app\/[A-Za-z0-9_-]+$/.test(url)?url:null;
 async function ensureTab(){
@@ -14,7 +14,7 @@ async function ensureTab(){
   await chrome.tabs.update(t.id,{autoDiscardable:false});
   await chrome.storage.local.set({tabId:t.id});return t.id;
 }
-async function heartbeat(ready,active){return api('/heartbeat',{ready,protocol,version,...(active?{task_id:active.id}:{})});}
+async function heartbeat(ready,active){return api('/heartbeat',{ready,protocol,version,...(active?{task_id:active.id,phase:active.phase}:{})});}
 async function cancelActive(tabId,active){
   await chrome.tabs.sendMessage(tabId,{kind:'cancel',id:active.id}).catch(()=>{});
   await chrome.storage.local.remove('active');
@@ -27,7 +27,7 @@ async function runTick(){
     // Reload only the dedicated tab when an extension update invalidates its script.
     await heartbeat(false).catch(()=>{});
     const tab=await chrome.tabs.get(tabId);if(tab.status!=='complete')return;
-    if(active?.phase==='generating'){
+    if(active?.phase==='generating'||active?.phase==='dispatching'){
       await api('/result',{id:active.id,ok:false,error:'browser_restarted'}).catch(()=>{});
       await chrome.storage.local.remove('active');
     }
@@ -51,8 +51,12 @@ async function runTick(){
   const {conversations={}}=await chrome.storage.local.get('conversations');
   const saved=conversation(conversations[task.session_id]);
   const page_url=(saved||'https://gemini.google.com/app')+'#nila-image-worker-'+task.id;
-  await chrome.storage.local.set({active:{...task,tabId,phase:'loading',page_url}});
+  const previous=await chrome.tabs.get(tabId);
+  await chrome.storage.local.set({active:{...task,tabId,phase:'loading',page_url,previous_document_id:status.document_id}});
   await chrome.tabs.update(tabId,{url:page_url});
+  // Hash-only navigation leaves the old editor/draft and content script alive.
+  // Require a new document even when two consecutive requests share a conversation.
+  if(previous.url?.split('#')[0]===page_url.split('#')[0])await chrome.tabs.reload(tabId);
 }
 function tick(){return serial(runTick).catch(()=>{});}
 chrome.runtime.onInstalled.addListener(()=>{chrome.alarms.create('worker',{periodInMinutes:0.5});void tick();});
@@ -67,30 +71,32 @@ chrome.runtime.onMessage.addListener((message,sender,respond)=>{
       const state=await heartbeat(message.ready===true&&message.protocol===protocol,active);
       if(active){
         if(state.task_active===false||Date.now()>active.expires){await cancelActive(tabId,active);return {expired:true};}
-        if(active.phase==='loading'&&message.ready===true&&!message.busy&&message.protocol===protocol&&message.pageUrl===active.page_url){
-          await chrome.storage.local.set({active:{...active,phase:'generating'}});return {task:active};
+        if((active.phase==='loading'||active.phase==='dispatching'&&message.document_id===active.document_id)&&message.ready===true&&!message.busy&&message.protocol===protocol&&message.document_id&&message.document_id!==active.previous_document_id&&(message.pageUrl===active.page_url||message.pageUrl===active.page_url.split('#')[0])){
+          await chrome.storage.local.set({active:{...active,phase:'dispatching',document_id:message.document_id}});return {task:active};
         }
         return {busy:true};
       }
       void tick();return {ok:true};
     }
-    if(message.kind==='result'&&active?.id===message.result?.id){
-      try{
-        const url=conversation(message.pageUrl?.split('#')[0]);
-        const previous=conversation(active.page_url?.split('#')[0]);
-        const actual=await chrome.tabs.get(tabId);
-        if(url&&(previous&&url!==previous||actual.url?.split('#')[0]!==url)){
-          await api('/result',{id:active.id,ok:false,error:'page_changed'});return {ignored:true};
-        }
-        await api('/result',message.result);
-        if(url&&(message.result.ok||message.result.error==='text_response')){
-          const {conversations={}}=await chrome.storage.local.get('conversations');
-          // Session IDs are random opaque IDs. No WeChat account IDs or group names
-          // leave the server. /newimg rotates the ID, leaving other entries intact.
-          conversations[active.session_id]=url;
-          await chrome.storage.local.set({conversations});
-        }
-      }finally{await chrome.storage.local.remove('active');}
+    if(message.kind==='started'&&active?.id===message.id&&active.document_id===message.document_id){
+      const state=await heartbeat(true,active);
+      if(state.task_active===false||Date.now()>active.expires){await cancelActive(tabId,active);return {expired:true};}
+      await chrome.storage.local.set({active:{...active,phase:'generating'}});return {ok:true};
+    }
+    if(message.kind==='result'&&active?.id===message.result?.id&&active.document_id===message.document_id){
+      const url=conversation(message.pageUrl?.split('#')[0]);
+      const previous=conversation(active.page_url?.split('#')[0]);
+      const actual=await chrome.tabs.get(tabId);
+      const wrong=url&&(previous&&url!==previous||actual.url?.split('#')[0]!==url);
+      const result=wrong?{id:active.id,ok:false,error:'page_changed'}:message.result;
+      // Save the user's conversation before releasing the task. A transient bridge
+      // failure must not dispatch another user's prompt over a result awaiting ACK.
+      if(!wrong&&url&&(result.ok||result.error==='text_response')){
+        const {conversations={}}=await chrome.storage.local.get('conversations');
+        conversations[active.session_id]=url;await chrome.storage.local.set({conversations});
+      }
+      try{await api('/result',result);}catch(error){if(error.status!==409)throw error;}
+      await chrome.storage.local.remove('active');
       void tick();return {ok:true};
     }
     return {ignored:true};
