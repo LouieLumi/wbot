@@ -252,12 +252,14 @@ test('extension repairs a lost page script, throttles reloads, and never replays
 });
 
 function conversationWorker(state:Record<string,any>={tabId:17}){
-  let url='https://gemini.google.com/app',listener:any,taskActive=true,doc=0,failResult=false;
+  let url='https://gemini.google.com/app',listener:any,taskActive=true,doc=0,failResult=false,tabId=17,failNavigation=false;
   const tasks:any[]=[],calls:{path:string;body:any}[]=[],navigations:string[]=[],cancellations:string[]=[];
   const event=()=>({addListener(){}});
   const chrome={
     storage:{local:{get:async(keys:string|string[])=>Object.fromEntries((Array.isArray(keys)?keys:[keys]).map(k=>[k,structuredClone(state[k])])),set:async(values:object)=>Object.assign(state,values),remove:async(key:string)=>{delete state[key];}}},
-    tabs:{get:async()=>({id:17,url,status:'complete'}),update:async(_id:number,patch:any)=>{if(patch.url){url=patch.url;navigations.push(url);doc++;}},reload:async()=>{doc++;},
+    tabs:{get:async(id:number)=>{if(id!==tabId)throw Error('tab_closed');return {id:tabId,url,status:'complete'};},
+      query:async()=>[{id:tabId,url,status:'complete'}],
+      update:async(_id:number,patch:any)=>{if(patch.url){if(failNavigation)throw Error('tab_temporarily_unavailable');url=patch.url;navigations.push(url);doc++;}},reload:async()=>{doc++;},
       sendMessage:async(_id:number,message:any)=>{if(message.kind==='cancel'){cancellations.push(message.id);return {ok:true};}return {ready:true,busy:false,protocol:3,document_id:'doc-'+doc};}},
     runtime:{onInstalled:event(),onStartup:event(),onMessage:{addListener:(fn:any)=>{listener=fn;}}},alarms:{onAlarm:event()},action:{onClicked:event()},
   };
@@ -268,9 +270,12 @@ function conversationWorker(state:Record<string,any>={tabId:17}){
       return {ok:true,json:async()=>path==='/claim'?{task:tasks.shift()??null}:path==='/heartbeat'?{ok:true,task_active:taskActive}:{ok:true}};
     }});
   const source=readFileSync(new URL('../apps/gemini-extension/worker.js',import.meta.url),'utf8').replace("import {endpoint,token} from './connection.js';",'');vm.runInContext(source,context);
-  const send=(message:any)=>new Promise<any>(resolve=>listener(message,{tab:{id:17},url:'https://gemini.google.com/app'},resolve));
+  const send=(message:any)=>new Promise<any>(resolve=>listener(message,{tab:{id:tabId},url:'https://gemini.google.com/app'},resolve));
   return {state,tasks,calls,navigations,cancellations,
     setActive(value:boolean){taskActive=value;},failResult(value:boolean){failResult=value;},setUrl(value:string){url=value;},
+    failNavigation(value:boolean){failNavigation=value;},
+    restoreTab(){tabId++;doc++;url='https://gemini.google.com/app#nila-image-worker';},
+    allowNavigationRetry(){state.active.last_navigation=Date.now()-6000;},
     tick:()=>vm.runInContext('tick()',context),
     async ready(){return send({kind:'ready',document_id:'doc-'+doc,ready:true,protocol:3,pageUrl:url});},
     async started(id:string){return send({kind:'started',id,document_id:'doc-'+doc});},
@@ -296,6 +301,42 @@ test('browser routes A then B then A into separate persistent conversations; a n
   assert.equal(restarted.navigations.at(-1),b+'#nila-image-worker-'+task.id);
   await restarted.ready();await restarted.finish(task.id,b);await restarted.settle();
   await run(randomUUID(),'https://gemini.google.com/app/fresh','https://gemini.google.com/app');
+});
+
+test('a restored worker tab resumes only an undispatched task in its assigned conversation',async()=>{
+  const {randomUUID}=await import('node:crypto'),session=randomUUID(),saved='https://gemini.google.com/app/owned';
+  const worker=conversationWorker({tabId:17,conversations:{[session]:saved}});
+  const task={id:randomUUID(),session_id:session,prompt:'继续画图',expires:Date.now()+60_000};
+  worker.tasks.push(task);await worker.tick();worker.restoreTab();worker.allowNavigationRetry();
+  await worker.tick();assert.equal(worker.state.tabId,18);assert.equal(worker.state.active.tabId,18);
+  assert.equal(worker.navigations.at(-1),saved+'#nila-image-worker-'+task.id);
+  assert.equal((await worker.ready()).task.id,task.id);await worker.started(task.id);
+  assert.equal(worker.state.active.phase,'generating');assert.equal(worker.calls.filter(c=>c.path==='/claim').length,1);
+});
+
+test('navigation failures retry before dispatch, with a limit and no lost result acknowledgement',async()=>{
+  const {randomUUID}=await import('node:crypto'),worker=conversationWorker();
+  const task={id:randomUUID(),session_id:randomUUID(),prompt:'画图',expires:Date.now()+60_000};
+  worker.tasks.push(task);worker.failNavigation(true);await worker.tick();
+  assert.equal(worker.state.active.phase,'loading');assert.equal(worker.state.active.load_attempts,1);
+  await worker.tick();assert.equal(worker.state.active.load_attempts,1);
+  worker.failNavigation(false);worker.allowNavigationRetry();await worker.tick();
+  assert.equal((await worker.ready()).task.id,task.id);
+  const failed=conversationWorker();failed.tasks.push({...task,id:randomUUID()});failed.failNavigation(true);await failed.tick();
+  for(let i=0;i<2;i++){failed.allowNavigationRetry();await failed.tick();}
+  failed.failResult(true);failed.allowNavigationRetry();await failed.tick();assert.equal(failed.state.active.load_attempts,3);
+  failed.failResult(false);await failed.tick();assert.equal(failed.state.active,undefined);
+  assert.equal(failed.calls.at(-1)?.body.error,'page_changed');
+});
+
+test('a missing tab after dispatch fails once instead of generating the same image again',async()=>{
+  const {randomUUID}=await import('node:crypto');
+  for(const started of [false,true]){
+    const worker=conversationWorker(),task={id:randomUUID(),session_id:randomUUID(),prompt:'画图',expires:Date.now()+60_000};
+    worker.tasks.push(task);await worker.tick();await worker.ready();if(started)await worker.started(task.id);
+    worker.restoreTab();await worker.tick();assert.equal(worker.state.active,undefined);
+    assert.equal(worker.navigations.length,1);assert.equal(worker.calls.at(-1)?.body.error,'browser_restarted');
+  }
 });
 
 test('cancelled browser tasks stop the current generation and a late result cannot replace another session',async()=>{

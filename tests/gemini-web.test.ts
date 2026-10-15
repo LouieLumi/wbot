@@ -6,6 +6,24 @@ import {imageErrorReply} from '../apps/server/src/images.js';
 const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=','base64');
 const config=readConfig({BRIDGE_API_TOKEN:'b'.repeat(64),GEMINI_WEB_TOKEN:'a'.repeat(64),GEMINI_WEB_EXTENSION_ID:'a'.repeat(32),IMAGE_PROVIDER:'gemini_web'});
 const headers={host:'127.0.0.1:3152',authorization:'Bearer '+config.GEMINI_WEB_TOKEN,origin:'chrome-extension://'+config.GEMINI_WEB_EXTENSION_ID};
+test('local extension reload is authenticated, idle-only, version-gated and consumed once',async()=>{
+ const images=new GeminiWebImages(),app=createGeminiWorker(config,images);
+ try{
+  assert.equal((await app.inject({method:'POST',url:'/reload-extension',headers:{host:headers.host}})).statusCode,401);
+  assert.equal((await app.inject({method:'POST',url:'/reload-extension',headers})).statusCode,409);
+  images.extension('1.2.3');images.heartbeat(true);
+  const abort=new AbortController(),pending=images.generate('test',abort.signal),cancelled=assert.rejects(pending,/image_cancelled/);
+  assert.equal((await app.inject({method:'POST',url:'/reload-extension',headers})).statusCode,409);
+  abort.abort();await cancelled;
+  assert.equal((await app.inject({method:'POST',url:'/reload-extension',headers})).statusCode,200);
+  // A new queued request must not deadlock a reload already requested at idle.
+  const queuedAbort=new AbortController(),queued=images.generate('queued',queuedAbort.signal),queuedCancelled=assert.rejects(queued,/image_cancelled/);
+  assert.equal(images.claim(true),null);
+  const beat={method:'POST' as const,url:'/heartbeat',headers,payload:{ready:true,protocol:3,version:'1.2.3'}};
+  assert.equal((await app.inject(beat)).json().reload_extension,true);assert.equal((await app.inject(beat)).json().reload_extension,undefined);
+  assert(images.claim(true));queuedAbort.abort();await queuedCancelled;
+ }finally{await app.close();}
+});
 test('an unconfirmed browser submission is reported distinctly and late results are rejected',async()=>{
  const images=new GeminiWebImages(),app=createGeminiWorker(config,images);images.heartbeat(true);
  try{

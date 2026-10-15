@@ -15,14 +15,20 @@ export class GeminiWebImages implements ImageGenerator {
   private extensionVersion:string|null=null;
   private phase:string|null=null;
   private workerFailure:{error:string;http_status:number;at:number}|null=null;
+  private navigationFailure:{stage:string;message:string;at:number}|null=null;
+  private reloadRequested=false;
   constructor(private timeoutMs=240_000,private connectTimeoutMs=45_000){}
-  status(){return {provider:'gemini_web',connected:this.ready&&Date.now()-this.seen<90_000,last_seen:this.seen||null,pending:this.tasks.size,last_error:this.lastError,extension_version:this.extensionVersion,phase:this.phase,worker_failure:this.workerFailure};}
+  status(){return {provider:'gemini_web',connected:this.ready&&Date.now()-this.seen<90_000,last_seen:this.seen||null,pending:this.tasks.size,last_error:this.lastError,extension_version:this.extensionVersion,phase:this.phase,worker_failure:this.workerFailure,navigation_failure:this.navigationFailure};}
   extension(version?:string,phase?:string){this.extensionVersion=version??null;this.phase=phase??null;}
   failure(error:string,httpStatus=0){this.workerFailure={error,http_status:httpStatus,at:Date.now()};}
+  navigationFailureAt(stage:string,message:string){this.navigationFailure={stage,message,at:Date.now()};}
+  requestReload(){if(this.tasks.size||this.extensionVersion!=='1.2.3')return false;this.reloadRequested=true;return true;}
+  takeReload(){if(!this.reloadRequested||[...this.tasks.values()].some(t=>t.claimed))return false;this.reloadRequested=false;return true;}
   active(id:string){return this.tasks.has(id);}
   heartbeat(ready:boolean){this.seen=Date.now();this.ready=ready;if(ready)for(const task of this.tasks.values())task.ready();}
   claim(ready:boolean){
     this.heartbeat(ready);
+    if(this.reloadRequested)return null;
     if(!ready||[...this.tasks.values()].some(t=>t.claimed))return null;
     const task=this.tasks.values().next().value as Task|undefined;
     if(!task)return null;
@@ -71,6 +77,11 @@ export function createGeminiWorker(config:Config,images:GeminiWebImages){
   });
   app.setErrorHandler((e,_,res)=>res.code(e instanceof z.ZodError?400:503).send({error:'invalid_worker_request'}));
   app.get('/status',async()=>images.status());
+  app.post('/reload-extension',async(_,res)=>images.requestReload()?{ok:true}:res.code(409).send({error:'worker_busy_or_unsupported'}));
+  app.post('/navigation-failure',async req=>{
+    const {stage,message}=z.object({stage:z.enum(['update','reload']),message:z.string().max(240)}).strict().parse(req.body);
+    images.navigationFailureAt(stage,message);return {ok:true};
+  });
   // Authenticated local diagnostic: fetch an existing Gemini asset, never generate
   // another image or send anything to WeChat. Only bounded metadata is returned.
   app.post('/probe-download',async req=>{
@@ -92,7 +103,7 @@ export function createGeminiWorker(config:Config,images:GeminiWebImages){
   const heartbeat=z.object({ready:z.boolean(),protocol:z.number().int().optional(),phase:z.enum(['loading','dispatching','generating']).optional(),version:z.string().max(32).optional(),task_id:z.string().uuid().optional()}).strict();
   app.post('/heartbeat',async req=>{
     const value=heartbeat.parse(req.body);images.extension(value.version,value.phase);images.heartbeat(value.ready&&value.protocol===3);
-    return {ok:true,...(value.task_id?{task_active:images.active(value.task_id)}:{}),upgrade_required:value.protocol!==3};
+    return {ok:true,...(value.task_id?{task_active:images.active(value.task_id)}:{}),...(!value.task_id&&images.takeReload()?{reload_extension:true}:{}),upgrade_required:value.protocol!==3};
   });
   app.post('/claim',async req=>{
     const value=heartbeat.parse(req.body);images.extension(value.version,value.phase);
