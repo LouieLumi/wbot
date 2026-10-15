@@ -46,7 +46,7 @@ flowchart LR
 
 ## 快速启动管理后台
 
-需要 Node.js **22.13+** 和 npm。以下使用 mock 设备，不连接真实微信、不发送消息。
+需要 Node.js **22.13+** 和 npm；完整检查还需要 JDK **17+**。以下使用 mock 设备，不连接真实微信、不发送消息。
 
 ```bash
 npm ci
@@ -118,7 +118,7 @@ npm run check
 python3 -m unittest discover -s tests -p '*_test.py'
 ```
 
-Python 测试需要 `requirements.txt` 中的依赖。单元测试不需要微信登录或 Gemini 会员；真实接入需要独立验收。
+`npm run check` 包含 Android 文字发送回执测试，需要 JDK 17+（通过 `JAVA_HOME`、本机 `.runtime/java` 或 PATH 查找）；可用 `npm run test:android` 单独运行。Python 测试需要 `requirements.txt` 中的依赖。单元测试不需要微信登录或 Gemini 会员；真实接入需要独立验收。
 
 - Android 模块当前适配微信 **8.0.79 / versionCode 3200**，其他版本不保证兼容。
 - Gemini 网页受登录状态、额度、网页更新和浏览器休眠影响，不是稳定的官方图片 API。

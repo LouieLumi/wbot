@@ -11,7 +11,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node --env-file-if-exists=.env dist/apps/server/src/main.js",
     "test": "tsx --test tests/*.test.ts",
-    "check": "npm run build && npm test",
+    "test:android": "node scripts/test-android-text-ledger.mjs",
+    "check": "npm run build && npm test && npm run test:android",
     "device:probe": ".runtime/venv/bin/python scripts/device-agent.py probe",
     "admin": "node --env-file=.env scripts/open-admin.mjs",
     "setup": "node scripts/init-env.mjs"

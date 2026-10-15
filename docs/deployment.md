@@ -2,7 +2,7 @@
 
 ## 1. 本机服务
 
-Node.js 22.13+，Python 3，支持 USB 调试的 Android 测试设备。macOS 是当前主要运行平台；管理服务与单元测试不要求手机。
+Node.js 22.13+，Python 3，JDK 17+（完整检查及 Android 构建），支持 USB 调试的 Android 测试设备。macOS 是当前主要运行平台；管理服务与单元测试不要求手机。
 
 ```bash
 npm ci

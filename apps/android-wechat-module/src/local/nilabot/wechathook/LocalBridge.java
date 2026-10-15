@@ -33,7 +33,7 @@ public final class LocalBridge {
     private volatile Map<String,String> groups = Collections.emptyMap();
     private final List<JSONObject> events = new ArrayList<>();
     private volatile long sequence = 0;
-    private final LinkedHashMap<String,JSONObject> sends = new LinkedHashMap<>();
+    private final TextSendLedger textSends;
     private final ThreadLocal<Boolean> ownQuery = new ThreadLocal<>();
     private final Map<String,String> names = new LinkedHashMap<>();
     private final SharedPreferences registrationStore;
@@ -69,6 +69,7 @@ public final class LocalBridge {
 
     private LocalBridge(Context context, ClassLoader loader, JSONObject config) throws Exception {
         this.loader = loader;
+        this.textSends=new TextSendLedger(new File(context.getFilesDir(),"nila-text-sends-v1"));
         this.registrationStore=context.getSharedPreferences("nila_group_requests_v1",Context.MODE_PRIVATE);
         this.imageStore=context.getSharedPreferences("nila_image_sends_v1",Context.MODE_PRIVATE);
         this.imageDirectory=new File(context.getFilesDir(),"nila-generated-images");
@@ -299,16 +300,32 @@ public final class LocalBridge {
     private JSONObject send(JSONObject request,boolean signupAck) throws Exception {
         String group=request.getString("chat_id"), content=request.getString("content"), id=request.getString("id");
         if(!id.matches("[A-Za-z0-9_:.\\-]{8,150}") || content.trim().isEmpty() || content.length()>2000) throw new IllegalArgumentException("invalid_send");
-        synchronized(sends) {
-            if(sends.containsKey(id)) return sends.get(id);
-            if(sends.size()>=100) throw new IllegalStateException("send_session_limit");
-        }
         refreshGroups(); if(!groups.containsKey(group)) throw new SecurityException("group_not_allowed");
         if(!signupAck&&!authorized.contains(group))throw new SecurityException("group_not_authorized");
         if(signupAck&&!content.equals("已发起使用请求"))throw new SecurityException("invalid_signup_ack");
-        // Remember before publishing. An interrupted request must never auto-resend.
+        // Persist before publishing, including across WeChat restarts.
+        TextSendLedger.Receipt receipt;
+        try{receipt=textSends.reserve(id,group,content);}
+        catch(IOException error){
+            Log.w("NilaWeChatHook","text_reservation_failed:"+error.getMessage());
+            return new JSONObject().put("state","failed").put("reason","text_reservation_failed");
+        }
+        if(!receipt.created)return new JSONObject().put("state",receipt.state).put("reason",receipt.reason);
         JSONObject result=new JSONObject().put("state","uncertain").put("reason","no_server_ack_yet");
-        synchronized(sends){sends.put(id,result);}
+        try{result=publishText(group,content);}
+        catch(Throwable error){result.put("reason","send_exception_"+error.getClass().getSimpleName());}
+        finally{
+            try{textSends.finish(id,group,content,result.getString("state"),result.getString("reason"));}
+            catch(IOException error){
+                Log.w("NilaWeChatHook","text_receipt_update_failed:"+error.getClass().getSimpleName());
+                result.put("state","uncertain").put("reason","text_receipt_update_failed");
+            }
+        }
+        return result;
+    }
+
+    private JSONObject publishText(String group,String content) throws Exception {
+        JSONObject result=new JSONObject().put("state","uncertain").put("reason","no_server_ack_yet");
         // WeChat derives createTime from its own clock. Fence by local row ID,
         // not wall time, so a successful send cannot disappear behind skew.
         long before=0;boolean fenced=false;
@@ -476,7 +493,7 @@ public final class LocalBridge {
                 URI uri=new URI(request[1]); JSONObject result;
                 if(request[0].equals("GET")&&uri.getPath().equals("/status")) {
                     result=new JSONObject().put("connected",true).put("mode","android_hook").put("generation",generation)
-                        .put("api_version",4).put("identity_supported",true).put("image_supported",true).put("signup_supported",true).put("database_handles",databases.size()).put("authorized_groups",authorized.size()).put("events",sequence);
+                        .put("api_version",5).put("text_receipts","persistent").put("identity_supported",true).put("image_supported",true).put("signup_supported",true).put("database_handles",databases.size()).put("authorized_groups",authorized.size()).put("events",sequence);
                 } else if(request[0].equals("POST")&&uri.getPath().equals("/identity/resolve")) {
                     result=resolveIdentity(new JSONObject(new String(bytes,StandardCharsets.UTF_8)));
                 } else if(request[0].equals("GET")&&uri.getPath().equals("/groups")) {
