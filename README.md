@@ -7,7 +7,7 @@
 ## 功能
 
 - **多群授权**：群成员发送 `/signup` 发起申请，后台批准后才启用。
-- **独立记忆**：按真实群 ID 与成员 ID 保存上下文、长期笔记和个人配置。
+- **成员记忆**：按成员微信 ID 跨群共享，Hermes 原生管理成员资料、长期笔记和历史对话；不同账号隔离，同名不合并。群授权、模型配置仍各自独立。
 - **统一管理员**：一个微信账号管理所有群的模型、启停和管理员菜单；普通成员管理自己的记忆。
 - **管理后台**：群聊、成员、模型、任务状态、密码登录与本机快捷登录。
 - **模型接入**：Ollama；Hermes + 本地 Ollama 或本机兼容 API；保留可选 OpenClaw 适配器。
@@ -119,6 +119,8 @@ python3 -m unittest discover -s tests -p '*_test.py'
 ```
 
 `npm run check` 包含 Android 文字发送回执测试，需要 JDK 17+（通过 `JAVA_HOME`、本机 `.runtime/java` 或 PATH 查找）；可用 `npm run test:android` 单独运行。Python 测试需要 `requirements.txt` 中的依赖。单元测试不需要微信登录或 Gemini 会员；真实接入需要独立验收。
+
+安装 Hermes 后，可单独运行 `python3 -m unittest discover -s tests -p hermes_memory_test.py -v` 验证原生成员记忆。该测试使用虚构资料和临时目录，不调用模型、不发送微信消息。
 
 - Android 模块当前适配微信 **8.0.79 / versionCode 3200**，其他版本不保证兼容。
 - Gemini 网页受登录状态、额度、网页更新和浏览器休眠影响，不是稳定的官方图片 API。

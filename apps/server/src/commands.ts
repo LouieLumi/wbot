@@ -23,14 +23,14 @@ export async function command(input:string,member:Member,memory:Memories,models:
       if(!arg)return '本群模型：'+(memory.group(chat)?.model||models.default());
       await models.validate(arg==='default'?'':arg);memory.groupModel(chat,arg==='default'?'':arg);
       return '本群模型已切换为 '+(arg==='default'?models.default():arg)+'，记忆保留。';
-    case 'new':memory.reset(chat,id,false);return '已新建你的本群会话，长期记忆保留。';
-    case 'reset':memory.reset(chat,id,true);return '已重置你的本群上下文和长期记忆。';
+    case 'new':memory.reset(chat,id,false);return '已新建你的会话，长期记忆保留，所有群同步生效。';
+    case 'reset':memory.reset(chat,id,true);return '已重置你的上下文和长期记忆，所有群同步生效。';
     case 'remember':
       if(!arg)return '用法：/remember 希望我记住的内容';
-      if((member.notes+'\n'+arg).length>4000)return '长期记忆已达上限，请先用 /forget 清空。';
-      memory.patch(chat,id,{notes:[member.notes,arg].filter(Boolean).join('\n')});return '已记入你的本群长期记忆。';
-    case 'forget':memory.patch(chat,id,{notes:''});return '已清空你的本群长期记忆，对话上下文保留。';
-    case 'memory':return `你的本群记忆\n上下文：${memory.history(chat,id).length/2} 轮\n长期记忆：${member.notes.length} 字`;
+      if((member.notes+'\n'+arg).length>8000)return '成员资料已达上限，请在后台整理后再添加。';
+      memory.patch(chat,id,{notes:[member.notes,arg].filter(Boolean).join('\n§\n')});return '已记入你的长期记忆，所有群共享。';
+    case 'forget':memory.patch(chat,id,{notes:'',summary:''});return '已清空你的长期记忆，所有群同步生效，对话上下文保留。';
+    case 'memory':return `你的记忆${member.memory_scope==='member'?' · 跨群共享':''}\n管理：${member.memory_backend==='hermes'?'Hermes':'本地'}\n已保存对话：${Math.floor((member.turn_count??memory.history(chat,id).length)/2)} 轮\n成员资料：${member.notes.length} 字\n长期笔记：${member.summary?.length??0} 字`;
     case 'status':return `本群状态：${memory.group(chat)?.paused?'已停用':'运行中'}\n模型：${memory.group(chat)?.model||models.default()}`;
     case 'stop':memory.groupControl(chat,true);return '已停用本群回复。发 /start 恢复。';
     case 'start':memory.groupControl(chat,false);return '已启用本群回复。';

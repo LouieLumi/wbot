@@ -35,6 +35,7 @@ export async function createApi(config:Config,bridge:Bridge) {
     if(['pause_before_registration','device_busy'].includes(code))return res.code(409).send({error:code});
     if(['group_not_found','member_not_found'].includes(code))return res.code(404).send({error:code});
     if(code==='model_not_installed')return res.code(400).send({error:code});
+    if(['memory_limit','hermes_memory_write_rejected'].includes(code))return res.code(400).send({error:code});
     if(code==='group_archived')return res.code(409).send({error:code});
     const status=(error as {statusCode?:number}).statusCode;
     return res.code(status&&status>=400&&status<500?status:503).send({error:status===429?'rate_limited':'operation_unavailable'});
@@ -67,6 +68,7 @@ export async function createApi(config:Config,bridge:Bridge) {
   });
   app.get('/api/health',async()=>({ok:true,mode:config.WECHAT_DEVICE_MODE,paused:bridge.paused,auto_reply:bridge.autoReply,
     image:bridge.imageStatus(),web_search:config.HERMES_WEB_SEARCH,
+    memory:{provider:bridge.memory.backend?'hermes':'local',scope:'member'},
     reliability:bridge.lastReliability,last_error:bridge.lastError,ai_provider:config.AI_PROVIDER,
     ai_model:config.AI_PROVIDER!=='openclaw'?bridge.models.default():config.OPENCLAW_AGENT_ID,
     openclaw_configured:config.OPENCLAW_ENDPOINT_VERIFIED&&config.OPENCLAW_AGENT_RESTRICTED&&Boolean(config.OPENCLAW_TOKEN)}));
@@ -105,9 +107,10 @@ export async function createApi(config:Config,bridge:Bridge) {
     if(body.model!==undefined)await bridge.models.validate(body.model);await bridge.groupPatch(id,body);return {ok:true};
   });
   app.get('/api/admin/groups/:id/members',async(req)=>{const {id}=groupParams.parse(req.params);return {members:bridge.memory.members(id)};});
+  app.get('/api/admin/members',async()=>({members:bridge.memory.allMembers()}));
   const memberParams=z.object({id:z.string().min(1).max(128),member:z.string().min(1).max(128)});
   app.get('/api/admin/groups/:id/members/:member',async(req,res)=>{const {id,member}=memberParams.parse(req.params);const value=bridge.memory.member(id,member);return value?{member:value,history:bridge.memory.history(id,member)}:res.code(404).send({error:'member_not_found'});});
-  app.patch('/api/admin/groups/:id/members/:member',async(req)=>{const {id,member}=memberParams.parse(req.params);const body=z.object({notes:z.string().max(4000).optional(),model:z.string().max(128).optional(),enabled:z.boolean().optional()}).strict().parse(req.body);if(body.model!==undefined)await bridge.models.validate(body.model);bridge.memory.patch(id,member,body);return {ok:true};});
+  app.patch('/api/admin/groups/:id/members/:member',async(req)=>{const {id,member}=memberParams.parse(req.params);const body=z.object({notes:z.string().max(8000).optional(),summary:z.string().max(8000).optional(),model:z.string().max(128).optional(),enabled:z.boolean().optional()}).strict().parse(req.body);if(body.model!==undefined)await bridge.models.validate(body.model);bridge.memory.patch(id,member,body);return {ok:true};});
   app.post('/api/admin/groups/:id/members/:member/reset',async(req)=>{const {id,member}=memberParams.parse(req.params);const {notes}=z.object({notes:z.boolean().default(true)}).strict().parse(req.body??{});bridge.memory.reset(id,member,notes);return {ok:true};});
   const sockets=new Set<WebSocket>();
   app.get('/api/events',{websocket:true},socket=>{

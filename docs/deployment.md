@@ -94,7 +94,15 @@ HERMES_WEB_SEARCH=false
 
 未配置 `HERMES_API_BASE_URL` 时，Hermes 使用 Ollama 的 `/v1`。接本机兼容 API 时设置 `HERMES_API_BASE_URL`、`HERMES_API_KEY`、`HERMES_MODEL`。模型端点必须为 loopback 地址，不允许直接填外部服务地址。
 
-启用搜索时设置 `HERMES_WEB_SEARCH=true`，在独立的 `.runtime/hermes-group-profile/config.yaml` 配置 Hermes 支持的搜索后端及必要凭据，例如已验证过的 `web.backend: exa` 与 `web.search_backend: exa`。只有 `web_search` 可用，不开放终端和本地文件工具，也不载入个人 Hermes 的记忆或上下文。请按本机 Hermes 版本确认搜索配置。
+启用搜索时设置 `HERMES_WEB_SEARCH=true`，在独立的 `.runtime/hermes-group-profile/config.yaml` 配置 Hermes 支持的搜索后端及必要凭据，例如已验证过的 `web.backend: exa` 与 `web.search_backend: exa`。模型只开放成员专用的 `memory`，以及按配置启用的 `web_search`；不开放终端和文件访问工具，不载入部署者个人 Hermes 的记忆或上下文。请按本机 Hermes 版本确认搜索配置。
+
+### Hermes 成员记忆
+
+`AI_PROVIDER=hermes` 时，每个已验证微信成员使用 `data/hermes-members/<微信 ID 摘要>/`，群 ID 不参与目录选择。成员资料与长期笔记分别由 Hermes `MemoryStore` 保存至 `memories/USER.md`、`memories/MEMORY.md`，对话由 Hermes `SessionDB` 保存至 `state.db`。首次启动会按真实成员 ID 合并旧群记录中的笔记及上下文；升级前备份 `data/bridge.sqlite` 和整个 `data/hermes-members`。旧视觉身份缺少稳定微信 ID，继续独立归档，不按昵称猜测合并。
+
+Hermes 在成员独立的临时目录中整理记忆，微信确认回复已送达后才提交到该成员的正式目录；失败或被重置的回答不提交。提交日志可在中断后恢复，恢复只处理记忆，不重新发送消息。同一成员的跨群请求等待前一条回复提交后再读取上下文。原生对话库保留已提交历史，回答使用最近 10 轮并按 6000 字符裁剪，长期资料和笔记各有 8000 字符预算。
+
+后台默认显示去重后的全部成员，可按群筛选。编辑记忆、`/remember`、`/forget`、`/reset` 在所有群生效；`/new` 或后台清空上下文保留长期记忆。模型、成员在某群的使用权限、群授权和群启停仍按群设置。生图仍使用独立的 Gemini 会话。
 
 ## 4. Gemini 网页图片
 

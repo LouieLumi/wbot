@@ -16,7 +16,8 @@ export function dashboard(store:Store,mode:Config['WECHAT_DEVICE_MODE'],groups:G
     coalesce(sum(state IN ('failed','uncertain') AND updated_at>=?),0) AS failed_today,
     coalesce(sum(state IN ('queued','running')),0) AS pending
     FROM jobs WHERE chat_id IN (${params})`).get(day.getTime(),day.getTime(),...ids):{sent_today:0,failed_today:0,pending:0};
-  return {groups:current,archived_groups:archived,stats:{...totals,groups:current.length,authorized:current.filter(g=>g.enabled).length,members:current.reduce((n,g)=>n+g.member_count,0)}};
+  const memberCount=ids.length?(store.db.prepare(`SELECT count(DISTINCT CASE WHEN id LIKE 'wxid:%' THEN id ELSE chat_id||':'||id END) n FROM members WHERE chat_id IN (${params})`).get(...ids) as {n:number}).n:0;
+  return {groups:current,archived_groups:archived,stats:{...totals,groups:current.length,authorized:current.filter(g=>g.enabled).length,members:memberCount}};
 }
 
 export function jobPage(store:Store,mode:Config['WECHAT_DEVICE_MODE'],query:{page:number;page_size:number;scope:'current'|'archived'|'all';state?:string;chat_id?:string;search?:string}){

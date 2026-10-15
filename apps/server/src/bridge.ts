@@ -86,6 +86,7 @@ export class Bridge extends EventEmitter {
   async tick(){
     if(this.busy||this.paused||this.closed)return;this.busy=true;let target:Chat|undefined;
     try{
+      for(const id of this.memory.reconcile())this.emitEvent({event:'memory.sync_failed',id});
       const lockedBefore=this.config.WECHAT_DEVICE_MODE==='adb'?await hostLocked():null;
       const job=this.store.next();
       if(job){
@@ -216,14 +217,22 @@ export class Bridge extends EventEmitter {
     const run=async()=>{
       if(signal.aborted||this.paused||!this.autoReply||!this.isAllowed(message.chat_id)||this.memory.group(message.chat_id)?.paused)return;
       try{
+        // Wait for this member's earlier reply in any group to commit its Hermes
+        // memory. Different people never share a profile or pending context.
+        const deadline=Date.now()+120_000;
+        while(this.memory.pendingMember(message.chat_id,member.id)){
+          if(signal.aborted||this.paused||Date.now()>deadline)return;
+          await new Promise(resolve=>setTimeout(resolve,100));
+        }
         const current=this.memory.member(message.chat_id,member.id);if(!current||current.revision!==member.revision)return;
-        let answer=await this.responder.reply({...message,content:text,member_id:member.id},signal);
+        const generated=await this.responder.reply({...message,content:text,member_id:member.id},signal);
+        let answer=typeof generated==='string'?generated:generated.content;
         if(signal.aborted||this.paused||!this.autoReply||!this.isAllowed(message.chat_id))return;
         if(!isCommand&&this.memory.member(message.chat_id,member.id)?.revision!==member.revision)return;
         const limit=this.config.WECHAT_DEVICE_MODE==='android_hook'?2000:100;
         if(answer.length>limit)answer=answer.slice(0,limit-9)+'…（已截短）';
         const job=await this.enqueue(message.chat_id,answer,'reply:'+message.message_id);
-        if(!isCommand)this.memory.stage(job.id,member,text,answer);
+        if(!isCommand)this.memory.stage(job.id,member,text,answer,typeof generated==='string'?undefined:generated.memory);
         this.lastReply.set(message.chat_id,Date.now());
       }catch(e){
         const reason=e instanceof ImageGenerationError?e.reason:e instanceof Error&&e.message==='model_not_installed'?'model_not_installed':'agent_unavailable_or_not_configured';

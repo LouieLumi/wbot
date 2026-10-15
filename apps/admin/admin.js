@@ -3,7 +3,7 @@ const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const views={overview:['总览','OVERVIEW'],groups:['群聊管理','GROUPS'],memory:['成员记忆','MEMORY'],models:['模型管理','MODELS'],jobs:['发送记录','DELIVERY'],commands:['命令管理','COMMANDS']};
 const statusLabels={queued:'排队中',running:'发送中',sent:'已发送',failed:'失败',uncertain:'待确认'};
-const errors={unauthorized:'登录已失效，请重新登录',ticket_expired:'登录链接已过期，请输入密码登录',invalid_password:'密码错误，请重新输入',group_archived:'该群已归档',pause_before_registration:'请先暂停机器人',device_busy:'手机正在处理任务，请稍后重试',operation_unavailable:'服务暂不可用，请检查手机或模型连接',model_not_installed:'模型当前不可用',invalid_request:'输入内容不符合要求',rate_limited:'操作频繁，请稍后重试',group_not_found:'群聊不存在',member_not_found:'成员不存在',job_not_found:'记录不存在'};
+const errors={memory_limit:'记忆容量已满，请整理后保存',hermes_memory_write_rejected:'Hermes 未接受这次记忆修改，请调整内容',unauthorized:'登录已失效，请重新登录',ticket_expired:'登录链接已过期，请输入密码登录',invalid_password:'密码错误，请重新输入',group_archived:'该群已归档',pause_before_registration:'请先暂停机器人',device_busy:'手机正在处理任务，请稍后重试',operation_unavailable:'服务暂不可用，请检查手机或模型连接',model_not_installed:'模型当前不可用',invalid_request:'输入内容不符合要求',rate_limited:'操作频繁，请稍后重试',group_not_found:'群聊不存在',member_not_found:'成员不存在',job_not_found:'记录不存在'};
 let state,models=[],modelsLoaded=false,currentView='overview',groupScope='current',selectedGroup='',selectedMember='',members=[],editingGroup='',editorDirty=false,globalDirty=false;
 let refreshTask,noticeTimer,memberRequest=0,detailRequest=0,jobsRequest=0,jobPage=1,jobPages=1,groupSignature='',optionsSignature='',recentSignature='',modelSignature='';
 let loggedIn=false,loginQueue=Promise.resolve(),pendingConfirm=null;
@@ -77,8 +77,8 @@ function renderState(){
  if(optionKey!==optionsSignature){
   optionsSignature=optionKey;
   const opts=groups=>groups.map(g=>`<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('');
-  $('#memory-group').innerHTML='<optgroup label="当前群聊">'+opts(state.groups)+'</optgroup>'+(state.archived_groups.length?'<optgroup label="历史归档">'+opts(state.archived_groups)+'</optgroup>':'');
-  if(!allGroups().some(g=>g.id===selectedGroup)){selectedGroup=state.groups[0]?.id||state.archived_groups[0]?.id||'';selectedMember='';}
+  $('#memory-group').innerHTML='<option value="">全部成员</option><optgroup label="当前群聊">'+opts(state.groups)+'</optgroup>'+(state.archived_groups.length?'<optgroup label="历史归档">'+opts(state.archived_groups)+'</optgroup>':'');
+  if(selectedGroup&&!allGroups().some(g=>g.id===selectedGroup)){selectedGroup='';selectedMember='';}
   $('#memory-group').value=selectedGroup;
   const jobGroup=$('#job-group').value;$('#job-group').innerHTML='<option value="">全部群聊</option>'+allGroups().map(g=>`<option value="${esc(g.id)}">${esc(g.name)}${archived(g.id)?' · 归档':''}</option>`).join('');$('#job-group').value=jobGroup;
  }
@@ -114,28 +114,29 @@ $('#auto-reply').onchange=event=>action(event.currentTarget,async()=>{try{await 
 $('#refresh').onclick=event=>action(event.currentTarget,async()=>{await refresh();if(currentView==='jobs')await loadJobs();if(currentView==='memory'){await loadMembers();if(selectedMember&&!editorDirty)await loadMember();}notify('已刷新');});
 
 async function loadMembers(){
- const group=selectedGroup,request=++memberRequest;if(!group){members=[];renderMembers();return;}
- const data=await api(`/api/admin/groups/${encodeURIComponent(group)}/members`);
+ const group=selectedGroup,request=++memberRequest;
+ const data=await api(group?`/api/admin/groups/${encodeURIComponent(group)}/members`:'/api/admin/members');
  if(request!==memberRequest||group!==selectedGroup||!loggedIn)return;members=data.members;renderMembers();
 }
 function renderMembers(){
  const search=$('#member-search').value.trim().toLocaleLowerCase(),filtered=members.filter(m=>m.name.toLocaleLowerCase().includes(search)||m.id.toLocaleLowerCase().includes(search));
  $('#member-count').textContent=members.length;
- $('#members').innerHTML=filtered.map(m=>`<button class="member-list-item ${m.id===selectedMember?'active':''}" data-member="${esc(m.id)}" ${m.id===selectedMember?'aria-current="true"':''}><span class="member-avatar">${esc(m.name[0]||'?')}</span><div><div class="member-name">${esc(m.name)}</div><div class="member-meta">${Math.floor(m.turn_count/2)} 轮对话 · ${m.enabled?'已启用':'已停用'}</div></div></button>`).join('')||'<div class="empty">'+(search?'未找到成员':'暂无成员')+'</div>';
+ $('#members').innerHTML=filtered.map(m=>`<button class="member-list-item ${m.id===selectedMember?'active':''}" data-member="${esc(m.id)}" ${m.id===selectedMember?'aria-current="true"':''}><span class="member-avatar">${esc(m.name[0]||'?')}</span><div><div class="member-name">${esc(m.name)}</div><div class="member-meta">${Math.floor(m.turn_count/2)} 轮对话 · ${m.memory_scope==='member'?(m.groups?.length||1)+' 个群':m.enabled?'已启用':'已停用'}</div></div></button>`).join('')||'<div class="empty">'+(search?'未找到成员':'暂无成员')+'</div>';
 }
-const memberPath=(group=selectedGroup,member=selectedMember)=>`/api/admin/groups/${encodeURIComponent(group)}/members/${encodeURIComponent(member)}`;
+const memberPath=(group=selectedGroup,member=selectedMember)=>`/api/admin/groups/${encodeURIComponent(group||members.find(m=>m.id===member)?.chat_id||'')}/members/${encodeURIComponent(member)}`;
 async function loadMember(){
  if(!selectedMember)return;const group=selectedGroup,member=selectedMember,request=++detailRequest;
  const {member:m,history}=await api(memberPath(group,member));if(request!==detailRequest||group!==selectedGroup||member!==selectedMember||!loggedIn)return;
  editorDirty=false;
- $('#memory-editor').innerHTML=`<div class="panel-heading"><div class="editor-title"><h2>${esc(m.name)}</h2><small>${esc(groupName(group))}${archived(group)?' · 历史归档':''}</small></div>${badge(m.enabled?'已启用':'已停用',m.enabled?'':'neutral')}</div><form id="member-form"><div class="editor-fields"><div class="field-row"><div><label for="member-model">专属模型</label><select id="member-model">${modelOptions(m.model)}</select></div><div><label for="member-enabled">使用权限</label><select id="member-enabled"><option value="true" ${m.enabled?'selected':''}>已启用</option><option value="false" ${!m.enabled?'selected':''}>已停用</option></select></div></div><label for="member-notes">长期记忆</label><textarea id="member-notes" rows="6" maxlength="4000" placeholder="添加记忆">${esc(m.notes)}</textarea><div class="editor-tools"><span id="memory-counter" class="muted">${m.notes.length} / 4000</span><button id="save-member" type="submit" class="primary">保存</button></div></div></form><div class="history-heading"><h2>对话上下文 <span class="muted">${Math.floor(history.length/2)} 轮</span></h2><div><button id="clear-context" class="text-button">清空上下文</button><span class="muted"> · </span><button id="reset-member" class="text-button danger-link">重置全部</button></div></div><div class="history">${history.map(t=>`<div class="turn ${esc(t.role)}"><div class="turn-header"><strong>${t.role==='user'?esc(m.name):'Nila'}</strong><span>${dt(t.created_at)}</span></div><div class="turn-content">${esc(t.content)}</div></div>`).join('')||'<div class="empty">暂无对话</div>'}</div>`;
- $('#member-form').oninput=()=>{editorDirty=true;$('#memory-counter').textContent=$('#member-notes').value.length+' / 4000';};
+ const scope=m.memory_scope==='member'?'所有群共享':groupName(group),native=m.memory_backend==='hermes';
+ $('#memory-editor').innerHTML=`<div class="panel-heading"><div class="editor-title"><h2>${esc(m.name)}</h2><small>${esc(scope)} · ${native?'Hermes':'本地'}</small></div>${badge(m.groups?.length?m.groups.length+' 个群':'成员','neutral')}</div><form id="member-form"><div class="editor-fields">${group?`<div class="field-row"><div><label for="member-model">本群专属模型</label><select id="member-model">${modelOptions(m.model)}</select></div><div><label for="member-enabled">本群使用权限</label><select id="member-enabled"><option value="true" ${m.enabled?'selected':''}>已启用</option><option value="false" ${!m.enabled?'selected':''}>已停用</option></select></div></div>`:''}<label for="member-notes">成员资料</label><textarea id="member-notes" rows="5" maxlength="8000" placeholder="添加成员资料">${esc(m.notes)}</textarea>${native?`<label for="member-summary">长期笔记</label><textarea id="member-summary" rows="5" maxlength="8000" placeholder="Hermes 长期记忆">${esc(m.summary)}</textarea>`:''}<div class="editor-tools"><span id="memory-counter" class="muted">资料 ${m.notes.length} / 8000${native?' · 笔记 '+m.summary.length+' / 8000':''}</span><button id="save-member" type="submit" class="primary">保存</button></div></div></form><div class="history-heading"><h2>最近对话 <span class="muted">共 ${Math.floor(m.turn_count/2)} 轮</span></h2><div><button id="clear-context" class="text-button">清空上下文</button><span class="muted"> · </span><button id="reset-member" class="text-button danger-link">重置全部</button></div></div><div class="history">${history.map(t=>`<div class="turn ${esc(t.role)}"><div class="turn-header"><strong>${t.role==='user'?esc(m.name):'Nila'}</strong><span>${dt(t.created_at)}</span></div><div class="turn-content">${esc(t.content)}</div></div>`).join('')||'<div class="empty">暂无对话</div>'}</div>`;
+ $('#member-form').oninput=()=>{editorDirty=true;$('#memory-counter').textContent='资料 '+$('#member-notes').value.length+' / 8000'+(native?' · 笔记 '+$('#member-summary').value.length+' / 8000':'');};
  $('#member-form').onchange=()=>{editorDirty=true;};
  $('#member-form').onsubmit=event=>{event.preventDefault();action(event.submitter,async()=>{
-  const path=memberPath(group,member),patch={notes:$('#member-notes').value,model:$('#member-model').value,enabled:$('#member-enabled').value==='true'};
+  const path=memberPath(group,member),patch={notes:$('#member-notes').value,...(native?{summary:$('#member-summary').value}:{}),...(group?{model:$('#member-model').value,enabled:$('#member-enabled').value==='true'}:{})};
   await api(path,'PATCH',patch);if(selectedGroup===group&&selectedMember===member){editorDirty=false;await loadMember();await loadMembers();}notify('记忆设置已保存');
  });};
- const reset=notes=>async event=>action(event.currentTarget,async()=>{if(!await confirmAction(notes?'重置全部记忆':'清空上下文',notes?'删除该成员在此群的对话上下文和长期记忆？此操作无法撤销。':'删除该成员在此群的对话上下文？长期记忆保留。此操作无法撤销。'))return;await api(memberPath(group,member)+'/reset','POST',{notes});if(selectedGroup===group&&selectedMember===member){editorDirty=false;await loadMember();await loadMembers();}notify(notes?'已重置全部记忆':'已清空上下文');});
+ const reset=notes=>async event=>action(event.currentTarget,async()=>{if(!await confirmAction(notes?'重置全部记忆':'清空上下文',notes?`删除该成员的对话和长期记忆？${scope}，此操作无法撤销。`:`删除该成员的对话上下文？${scope}，长期记忆保留。`))return;await api(memberPath(group,member)+'/reset','POST',{notes});if(selectedGroup===group&&selectedMember===member){editorDirty=false;await loadMember();await loadMembers();}notify(notes?'已重置全部记忆':'已清空上下文');});
  $('#clear-context').onclick=reset(false);$('#reset-member').onclick=reset(true);renderMembers();
 }
 $('#memory-group').onchange=async()=>{if(!canLeaveEditor()){$('#memory-group').value=selectedGroup;return;}selectedGroup=$('#memory-group').value;selectedMember='';editorDirty=false;detailRequest++;$('#memory-editor').innerHTML='<div class="empty tall">选择成员</div>';$('#member-search').value='';try{await loadMembers();}catch(e){notify(e.message,true);}};

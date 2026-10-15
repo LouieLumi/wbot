@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { Config } from './config.js';
 import type { Message } from '../../../packages/shared/types.js';
-export interface Responder { reply(message:Message, signal?:AbortSignal):Promise<string> }
+import type {MemoryDraft} from './hermes-memory.js';
+export interface GeneratedReply {content:string;memory?:MemoryDraft}
+export interface Responder { reply(message:Message, signal?:AbortSignal):Promise<string|GeneratedReply> }
 export class OpenClaw implements Responder {
   constructor(private config:Config) {}
   async reply(message:Message, signal?:AbortSignal):Promise<string> {

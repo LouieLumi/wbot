@@ -1,9 +1,10 @@
 import {createHash,randomUUID} from 'node:crypto';
 import type {Store} from './store.js';
 import type {Chat,SignupRequest} from '../../../packages/shared/types.js';
+import {memberMemoryKey,verifiedMember,type MemberMemoryBackend,type MemoryDraft} from './hermes-memory.js';
 
 export interface Group extends Chat {enabled:boolean;paused:boolean;model:string;last_poll:number;last_message:number;error:string;signup_pending:boolean;requested_at:number}
-export interface Member {chat_id:string;id:string;name:string;avatar_hash:string;notes:string;model:string;enabled:boolean;revision:number;last_seen:number;identity:'wechat_id'|'visual'|'name_only';turn_count?:number}
+export interface Member {chat_id:string;id:string;name:string;avatar_hash:string;notes:string;summary?:string;memory_backend?:string;memory_scope?:'member'|'group';model:string;enabled:boolean;revision:number;last_seen:number;identity:'wechat_id'|'visual'|'name_only';turn_count?:number;groups?:{id:string;name:string}[]}
 export interface Turn {role:'user'|'assistant';content:string;created_at:number}
 const normalized=(s:string)=>s.normalize('NFKC').replace(/\s+/g,'');
 const sameAvatar=(a:string,b:string)=>{
@@ -13,7 +14,7 @@ const sameAvatar=(a:string,b:string)=>{
   while(bits){bits&=bits-1n;if(++count>3)return false;}return true;
 };
 export class Memories {
-  constructor(readonly store:Store){
+  constructor(readonly store:Store,readonly backend?:MemberMemoryBackend){
     store.db.exec(`CREATE TABLE IF NOT EXISTS groups(id TEXT PRIMARY KEY,name TEXT NOT NULL,type TEXT NOT NULL,verified INTEGER NOT NULL,enabled INTEGER NOT NULL,model TEXT NOT NULL DEFAULT '',last_poll INTEGER NOT NULL DEFAULT 0,last_message INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS members(chat_id TEXT NOT NULL,id TEXT NOT NULL,name TEXT NOT NULL,avatar_hash TEXT NOT NULL,notes TEXT NOT NULL DEFAULT '',model TEXT NOT NULL DEFAULT '',enabled INTEGER NOT NULL DEFAULT 1,revision INTEGER NOT NULL DEFAULT 0,last_seen INTEGER NOT NULL,PRIMARY KEY(chat_id,id));
     CREATE TABLE IF NOT EXISTS turns(seq INTEGER PRIMARY KEY AUTOINCREMENT,chat_id TEXT NOT NULL,member_id TEXT NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL,created_at INTEGER NOT NULL);
@@ -26,6 +27,48 @@ export class Memories {
     if(!columns.has('signup_pending'))store.db.exec('ALTER TABLE groups ADD COLUMN signup_pending INTEGER NOT NULL DEFAULT 0');
     if(!columns.has('requested_at'))store.db.exec('ALTER TABLE groups ADD COLUMN requested_at INTEGER NOT NULL DEFAULT 0');
     if(!columns.has('paused'))store.db.exec('ALTER TABLE groups ADD COLUMN paused INTEGER NOT NULL DEFAULT 0');
+    store.db.exec("CREATE TABLE IF NOT EXISTS member_profiles(id TEXT PRIMARY KEY,notes TEXT NOT NULL DEFAULT '')");
+    const replyColumns=new Set((store.db.prepare('PRAGMA table_info(reply_context)').all() as {name:string}[]).map(r=>r.name));
+    if(!replyColumns.has('memory_draft'))store.db.exec('ALTER TABLE reply_context ADD COLUMN memory_draft TEXT');
+    for(const {id} of store.db.prepare("SELECT DISTINCT id FROM members WHERE id LIKE 'wxid:%'").all() as {id:string}[])this.ensureProfile('',id);
+  }
+  private scope(chat:string,id:string){return verifiedMember(id)?{where:'member_id=?',args:[id]}:{where:'chat_id=? AND member_id=?',args:[chat,id]};}
+  private ensureProfile(chat:string,id:string){
+    if(verifiedMember(id)&&!this.store.db.prepare('SELECT 1 FROM member_profiles WHERE id=?').get(id)){
+      const notes=[...new Set((this.store.db.prepare("SELECT notes FROM members WHERE id=? AND notes<>'' ORDER BY last_seen").all(id) as {notes:string}[]).map(r=>r.notes))];
+      this.store.db.prepare('INSERT INTO member_profiles VALUES(?,?)').run(id,notes.join('\n§\n'));
+    }
+    if(this.backend){
+      const scope=this.scope(chat,id);
+      const history=this.store.db.prepare(`SELECT seq,role,content,created_at FROM turns WHERE ${scope.where} ORDER BY seq`).all(...scope.args) as unknown as (Turn&{seq:number})[];
+      const notes=verifiedMember(id)?(this.store.db.prepare('SELECT notes FROM member_profiles WHERE id=?').get(id) as {notes:string}).notes:
+        (this.store.db.prepare('SELECT notes FROM members WHERE chat_id=? AND id=?').get(chat,id) as {notes:string}|undefined)?.notes??'';
+      this.backend.ensure(memberMemoryKey(chat,id),notes?notes.split('\n§\n'):[],history);
+    }
+  }
+  private decorate(row:any):Member {
+    this.ensureProfile(row.chat_id,row.id);const scope=this.scope(row.chat_id,row.id);
+    const native=this.backend?.snapshot(memberMemoryKey(row.chat_id,row.id));
+    const notes=native?.notes??(verifiedMember(row.id)?(this.store.db.prepare('SELECT notes FROM member_profiles WHERE id=?').get(row.id) as {notes:string}).notes:row.notes);
+    const turnCount=native?.turn_count??(this.store.db.prepare(`SELECT count(*) n FROM turns WHERE ${scope.where}`).get(...scope.args) as {n:number}).n;
+    return {...row,notes,summary:native?.summary??'',memory_backend:native?'hermes':'local',memory_scope:verifiedMember(row.id)?'member':'group',turn_count:turnCount,
+      enabled:!!row.enabled,identity:verifiedMember(row.id)?'wechat_id':row.avatar_hash?'visual':'name_only',
+      groups:this.store.db.prepare('SELECT g.id,g.name FROM groups g JOIN members m ON m.chat_id=g.id WHERE m.id=? ORDER BY g.name').all(row.id) as {id:string;name:string}[]};
+  }
+  allMembers():Member[]{
+    const rows=this.store.db.prepare('SELECT * FROM members ORDER BY last_seen DESC').all() as any[],seen=new Set<string>();
+    return rows.filter(row=>{if(!verifiedMember(row.id))return false;const key=memberMemoryKey(row.chat_id,row.id);if(seen.has(key))return false;seen.add(key);return true;}).map(row=>this.decorate(row));
+  }
+  pendingMember(chat:string,id:string){
+    const scope=this.scope(chat,id);
+    return !!this.store.db.prepare(`SELECT 1 FROM reply_context WHERE ${scope.where} LIMIT 1`).get(...scope.args);
+  }
+  reconcile(){
+    const failures:string[]=[];
+    for(const r of this.store.db.prepare("SELECT r.job_id,j.state FROM reply_context r JOIN jobs j ON j.id=r.job_id WHERE j.state NOT IN ('queued','running')").all() as {job_id:string;state:string}[]){
+      try{this.complete(r.job_id,r.state==='sent');}catch{failures.push(r.job_id);}
+    }
+    return failures;
   }
   sync(chats:Chat[],allowed:string[]){
     this.store.db.prepare('UPDATE groups SET verified=0').run();
@@ -76,8 +119,8 @@ export class Memories {
   }
   signupForJob(job:string):SignupRequest|undefined{return this.store.db.prepare('SELECT request_id,chat_id,chat_name,requested_at FROM signup_requests WHERE job_id=?').get(job) as SignupRequest|undefined;}
   observed(chat:string,error='',message=false){this.store.db.prepare('UPDATE groups SET last_poll=?,error=?,last_message=CASE WHEN ? THEN ? ELSE last_message END WHERE id=?').run(Date.now(),error,Number(message),Date.now(),chat);}
-  members(chat:string):Member[]{return (this.store.db.prepare('SELECT m.*,(SELECT count(*) FROM turns t WHERE t.chat_id=m.chat_id AND t.member_id=m.id) AS turn_count FROM members m WHERE chat_id=? ORDER BY last_seen DESC').all(chat) as any[]).map(r=>({...r,enabled:!!r.enabled,identity:r.id.startsWith('wxid:')?'wechat_id':r.avatar_hash?'visual':'name_only'}));}
-  member(chat:string,id:string){return this.members(chat).find(m=>m.id===id);}
+  members(chat:string):Member[]{return (this.store.db.prepare('SELECT * FROM members WHERE chat_id=? ORDER BY last_seen DESC').all(chat) as any[]).map(row=>this.decorate(row));}
+  member(chat:string,id:string){const row=this.store.db.prepare('SELECT * FROM members WHERE chat_id=? AND id=?').get(chat,id);return row?this.decorate(row):undefined;}
   identifyWechat(chat:string,wxid:string,name:string):Member {
     if(!/^[\w@.\-]{1,128}$/.test(wxid))throw new Error('invalid_member_id');
     const id='wxid:'+createHash('sha256').update(wxid).digest('hex');
@@ -96,18 +139,33 @@ export class Memories {
     this.store.db.prepare('INSERT INTO members(chat_id,id,name,avatar_hash,last_seen) VALUES(?,?,?,?,?) ON CONFLICT(chat_id,id) DO UPDATE SET name=excluded.name,last_seen=excluded.last_seen').run(chat,id,name,avatar,Date.now());
     return this.member(chat,id)!;
   }
-  patch(chat:string,id:string,patch:{notes?:string;model?:string;enabled?:boolean}){
+  patch(chat:string,id:string,patch:{notes?:string;summary?:string;model?:string;enabled?:boolean}){
     if(!this.member(chat,id))throw new Error('member_not_found');
-    for(const key of ['notes','model','enabled'] as const)if(patch[key]!==undefined)this.store.db.prepare(`UPDATE members SET ${key}=?,revision=revision+1 WHERE chat_id=? AND id=?`).run(key==='enabled'?Number(patch[key]):String(patch[key]),chat,id);
+    if(patch.notes!==undefined||patch.summary!==undefined){
+      this.backend?.patch(memberMemoryKey(chat,id),{...(patch.notes!==undefined?{notes:patch.notes}:{}),...(patch.summary!==undefined?{summary:patch.summary}:{})});
+      if(verifiedMember(id)){
+        if(patch.notes!==undefined)this.store.db.prepare('UPDATE member_profiles SET notes=? WHERE id=?').run(patch.notes,id);
+        this.store.db.prepare('UPDATE members SET revision=revision+1 WHERE id=?').run(id);
+      }else this.store.db.prepare('UPDATE members SET notes=?,revision=revision+1 WHERE chat_id=? AND id=?').run(patch.notes??this.member(chat,id)!.notes,chat,id);
+    }
+    for(const key of ['model','enabled'] as const)if(patch[key]!==undefined)this.store.db.prepare(`UPDATE members SET ${key}=?,revision=revision+1 WHERE chat_id=? AND id=?`).run(key==='enabled'?Number(patch[key]):String(patch[key]),chat,id);
   }
   reset(chat:string,id:string,notes=true){
     if(!this.member(chat,id))throw new Error('member_not_found');
+    this.backend?.reset(memberMemoryKey(chat,id),notes);
     this.store.db.exec('BEGIN');try{
-      this.store.db.prepare('DELETE FROM turns WHERE chat_id=? AND member_id=?').run(chat,id);
-      this.store.db.prepare("UPDATE members SET revision=revision+1,notes=CASE WHEN ? THEN '' ELSE notes END WHERE chat_id=? AND id=?").run(Number(notes),chat,id);this.store.db.exec('COMMIT');
+      const scope=this.scope(chat,id);this.store.db.prepare(`DELETE FROM turns WHERE ${scope.where}`).run(...scope.args);
+      if(verifiedMember(id)){
+        this.store.db.prepare("UPDATE members SET revision=revision+1,notes=CASE WHEN ? THEN '' ELSE notes END WHERE id=?").run(Number(notes),id);
+        if(notes)this.store.db.prepare("UPDATE member_profiles SET notes='' WHERE id=?").run(id);
+      }else this.store.db.prepare("UPDATE members SET revision=revision+1,notes=CASE WHEN ? THEN '' ELSE notes END WHERE chat_id=? AND id=?").run(Number(notes),chat,id);
+      this.store.db.exec('COMMIT');
     }catch(e){this.store.db.exec('ROLLBACK');throw e;}
   }
-  history(chat:string,id:string):Turn[]{return (this.store.db.prepare('SELECT role,content,created_at FROM turns WHERE chat_id=? AND member_id=? ORDER BY seq DESC LIMIT 20').all(chat,id) as unknown as Turn[]).reverse();}
+  history(chat:string,id:string):Turn[]{
+    if(this.backend){this.ensureProfile(chat,id);return this.backend.snapshot(memberMemoryKey(chat,id)).history;}
+    const scope=this.scope(chat,id);return (this.store.db.prepare(`SELECT role,content,created_at FROM turns WHERE ${scope.where} ORDER BY seq DESC LIMIT 20`).all(...scope.args) as unknown as Turn[]).reverse();
+  }
   imageSession(chat:string,id:string):string{
     if(!this.member(chat,id))throw new Error('member_not_found');
     this.store.db.prepare('INSERT OR IGNORE INTO image_sessions VALUES(?,?,?)').run(chat,id,randomUUID());
@@ -124,7 +182,7 @@ export class Memories {
     }catch(e){this.store.db.exec('ROLLBACK');throw e;}
   }
   trackImageJob(job:string,member:Member,session:string){this.store.db.prepare('INSERT OR IGNORE INTO image_reply_context VALUES(?,?,?,?,?)').run(job,member.chat_id,member.id,member.revision,session);}
-  stage(job:string,member:Member,user:string,answer:string){this.store.db.prepare('INSERT OR IGNORE INTO reply_context VALUES(?,?,?,?,?,?)').run(job,member.chat_id,member.id,member.revision,user,answer);}
+  stage(job:string,member:Member,user:string,answer:string,draft?:MemoryDraft){this.store.db.prepare('INSERT OR IGNORE INTO reply_context(job_id,chat_id,member_id,revision,user_text,answer,memory_draft) VALUES(?,?,?,?,?,?,?)').run(job,member.chat_id,member.id,member.revision,user,answer,draft?JSON.stringify(draft):null);}
   valid(job:string){
     const image=this.store.db.prepare('SELECT * FROM image_reply_context WHERE job_id=?').get(job) as any;
     if(image){const m=this.member(image.chat_id,image.member_id);if(!m?.enabled||m.revision!==image.revision||this.imageSession(image.chat_id,image.member_id)!==image.session_id)return false;}
@@ -134,9 +192,11 @@ export class Memories {
     const r=this.store.db.prepare('SELECT * FROM reply_context WHERE job_id=?').get(job) as any;if(!r){this.store.db.prepare('DELETE FROM image_reply_context WHERE job_id=?').run(job);return;}
     this.store.db.exec('BEGIN');try{
       if(sent&&this.valid(job)){
+        this.backend?.commit(memberMemoryKey(r.chat_id,r.member_id),job,r.user_text,r.answer,r.memory_draft?JSON.parse(r.memory_draft):undefined);
         const put=this.store.db.prepare('INSERT INTO turns(chat_id,member_id,role,content,created_at) VALUES(?,?,?,?,?)');
         put.run(r.chat_id,r.member_id,'user',r.user_text,Date.now());put.run(r.chat_id,r.member_id,'assistant',r.answer,Date.now());
-        this.store.db.prepare('DELETE FROM turns WHERE chat_id=? AND member_id=? AND seq NOT IN (SELECT seq FROM turns WHERE chat_id=? AND member_id=? ORDER BY seq DESC LIMIT 20)').run(r.chat_id,r.member_id,r.chat_id,r.member_id);
+        const scope=this.scope(r.chat_id,r.member_id);
+        this.store.db.prepare(`DELETE FROM turns WHERE ${scope.where} AND seq NOT IN (SELECT seq FROM turns WHERE ${scope.where} ORDER BY seq DESC LIMIT 20)`).run(...scope.args,...scope.args);
       }
       this.store.db.prepare('DELETE FROM reply_context WHERE job_id=?').run(job);this.store.db.prepare('DELETE FROM image_reply_context WHERE job_id=?').run(job);this.store.db.exec('COMMIT');
     }catch(e){this.store.db.exec('ROLLBACK');throw e;}

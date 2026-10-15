@@ -38,14 +38,14 @@ test('code events baseline, duplicates, overflow, pause and phone restart never 
   }finally{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));}
 });
 
-test('stable member IDs survive display-name changes and separate equal names, groups and old visual records',()=>{
+test('stable member IDs share memory across groups but separate equal names and old visual records',()=>{
   const store=new Store(':memory:'),memory=new Memories(store);
   try{
     const a=memory.identifyWechat('g1','wxid_alice','同名');
     memory.patch('g1',a.id,{notes:'Alice only'});
     assert.equal(memory.identifyWechat('g1','wxid_alice','新昵称').notes,'Alice only');
     assert.equal(memory.identifyWechat('g1','wxid_bob','同名').notes,'');
-    assert.equal(memory.identifyWechat('g2','wxid_alice','同名').notes,'');
+    assert.equal(memory.identifyWechat('g2','wxid_alice','同名').notes,'Alice only');
     assert.notEqual(memory.identify('g1','同名').id,a.id);
     assert.equal(memory.member('g1',a.id)?.identity,'wechat_id');
   }finally{store.close();}
