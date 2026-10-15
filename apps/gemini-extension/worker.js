@@ -1,5 +1,5 @@
 import {endpoint,token} from './connection.js';
-const protocol=3,version='1.2.3';
+const protocol=3,version='1.2.4';
 let operations=Promise.resolve();
 const serial=run=>{const result=operations.then(run);operations=result.catch(()=>{});return result;};
 const api=async(path,body)=>{
@@ -29,6 +29,17 @@ async function failActive(active,error){
   try{await api('/result',{id:active.id,ok:false,error});}catch(e){if(e.status!==409)throw e;}
   await chrome.storage.local.remove('active');
 }
+async function navigationSettled(tabId,url){
+  // tabs.update resolves when navigation starts, before Tab.url necessarily changes.
+  // Reloading then can cancel the pending hash change and reload the old worker URL.
+  const expires=Date.now()+10_000;
+  while(Date.now()<expires){
+    const tab=await chrome.tabs.get(tabId);
+    if(tab.url===url&&tab.status==='complete'&&!tab.pendingUrl)return;
+    await new Promise(resolve=>setTimeout(resolve,100));
+  }
+  throw Error('navigation_not_committed');
+}
 async function loadTask(tabId,active,status){
   const previous=await chrome.tabs.get(tabId);
   const loading={...active,tabId,phase:'loading',previous_document_id:status?.document_id,
@@ -38,7 +49,10 @@ async function loadTask(tabId,active,status){
   try{
     await chrome.tabs.update(tabId,{url:active.page_url});
     // A hash change does not reset a draft or create a new page script.
-    stage='reload';if(previous.url?.split('#')[0]===active.page_url.split('#')[0])await chrome.tabs.reload(tabId);
+    if(previous.url?.split('#')[0]===active.page_url.split('#')[0]){
+      await navigationSettled(tabId,active.page_url);
+      stage='reload';await chrome.tabs.reload(tabId);
+    }
   }catch(error){
     const message=String(error?.message||'navigation_failed').replace(/https?:\/\/\S+/g,'[url]').slice(0,240);
     await api('/navigation-failure',{stage,message}).catch(()=>{});throw error;

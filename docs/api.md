@@ -53,6 +53,8 @@ WebSocket 事件包括 `message.received`、`job.updated`、`reply.failed`、`co
 
 ## Gemini 下载诊断
 
-独立本机 worker 端口上的 `POST /probe-download` 使用 `GEMINI_WEB_TOKEN` 鉴权，接收 `{ "url": "https://lh3.googleusercontent.com/gg-dl/..." }`。只接受 Google 生成图片路径，在 worker 空闲时通过现有浏览器下载该资源，返回 MIME、字节数和 SHA-256；不会提交提示词或发送微信群消息。`GET /status` 的 `worker_failure` 保留错误类型和 HTTP 状态，不包含图片地址、提示词或登录信息。
+独立本机 worker 端口上的 `POST /probe-download` 使用 `GEMINI_WEB_TOKEN` 鉴权，接收 `{ "url": "https://lh3.googleusercontent.com/gg-dl/..." }`。只接受 Google 生成图片路径或当前 Gemini 页面生成的 `blob:https://gemini.google.com/<UUID>`，在 worker 空闲时通过现有浏览器下载该资源，返回 MIME、字节数和 SHA-256；不会提交提示词或发送微信群消息。`GET /status` 的 `worker_failure` 保留错误类型和 HTTP 状态，不包含图片地址、提示词或登录信息。
+
+`POST /probe-generation` 使用相同鉴权，接收 `{ "prompt": "画一个红苹果" }`（1–1000 字符），在空闲时创建独立诊断会话，验证提交、生成、下载并返回图片元数据。该入口不接收微信目标，也不会创建微信群发送任务。
 
 `POST /navigation-failure` 记录扩展导航或刷新失败的阶段与限长错误信息，扩展会移除其中的 URL。`POST /reload-extension` 仅允许受支持且空闲的扩展重载已安装代码，鉴权方式相同；不会增加权限或修改登录信息，忙碌时返回 409。

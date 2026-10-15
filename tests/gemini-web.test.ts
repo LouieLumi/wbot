@@ -24,6 +24,18 @@ test('local extension reload is authenticated, idle-only, version-gated and cons
   assert(images.claim(true));queuedAbort.abort();await queuedCancelled;
  }finally{await app.close();}
 });
+test('generation diagnosis requires authentication and creates an isolated task without a WeChat destination',async()=>{
+ const images=new GeminiWebImages(2000,1000),app=createGeminiWorker(config,images);images.heartbeat(true);
+ try{
+  assert.equal((await app.inject({method:'POST',url:'/probe-generation',headers:{host:headers.host},payload:{prompt:'red apple'}})).statusCode,401);
+  assert.equal((await app.inject({method:'POST',url:'/probe-generation',headers,payload:{prompt:'red apple',chat_id:'chat'}})).statusCode,400);
+  const response=app.inject({method:'POST',url:'/probe-generation',headers,payload:{prompt:'red apple'}}).then(r=>r);
+  for(let i=0;i<50&&!images.status().pending;i++)await new Promise(resolve=>setTimeout(resolve,5));
+  const task=images.claim(true)!;assert.equal(task.prompt,'red apple');assert.equal(task.image_url,undefined);assert(task.session_id);
+  images.complete(task.id,{mime_type:'image/png',data:png});
+  const result=(await response).json();assert.equal(result.ok,true);assert.equal(result.bytes,png.length);assert.equal(result.data,undefined);
+ }finally{await app.close();}
+});
 test('an unconfirmed browser submission is reported distinctly and late results are rejected',async()=>{
  const images=new GeminiWebImages(),app=createGeminiWorker(config,images);images.heartbeat(true);
  try{
@@ -152,7 +164,7 @@ test('download diagnosis is authenticated, restricted to generated assets and re
  const images=new GeminiWebImages(2000,1000),app=createGeminiWorker(config,images);images.heartbeat(true);
  try{
   assert.equal((await app.inject({method:'POST',url:'/probe-download',headers:{host:headers.host},payload:{url:'https://lh3.googleusercontent.com/gg-dl/asset'}})).statusCode,401);
-  for(const url of ['http://127.0.0.1/private','https://unrelated.example/image','https://lh3.googleusercontent.com/profile/photo']){
+  for(const url of ['http://127.0.0.1/private','https://unrelated.example/image','https://lh3.googleusercontent.com/profile/photo','blob:https://unrelated.example/123','blob:https://gemini.google.com/not-a-generated-blob']){
    assert.equal((await app.inject({method:'POST',url:'/probe-download',headers,payload:{url}})).statusCode,400);
   }
   for(const version of ['1.2.0','1.1.9','invalid']){
@@ -161,10 +173,12 @@ test('download diagnosis is authenticated, restricted to generated assets and re
    assert.equal(images.status().pending,0);
   }
   images.extension('1.2.1');
-  const response=app.inject({method:'POST',url:'/probe-download',headers,payload:{url:'https://lh3.googleusercontent.com/gg-dl/asset'}}).then(r=>r);
+  for(const url of ['https://lh3.googleusercontent.com/gg-dl/asset','blob:https://gemini.google.com/a852c388-2a55-4ecf-8db7-86e4f9c4337b']){
+  const response=app.inject({method:'POST',url:'/probe-download',headers,payload:{url}}).then(r=>r);
   for(let i=0;i<50&&!images.status().pending;i++)await new Promise(resolve=>setTimeout(resolve,5));
-  const task=images.claim(true)!;assert.equal(task.image_url,'https://lh3.googleusercontent.com/gg-dl/asset');
+  const task=images.claim(true)!;assert.equal(task.image_url,url);
   images.complete(task.id,{mime_type:'image/png',data:png});
   const result=(await response).json();assert.equal(result.ok,true);assert.equal(result.bytes,png.length);assert.equal(result.data,undefined);
+  }
  }finally{await app.close();}
 });

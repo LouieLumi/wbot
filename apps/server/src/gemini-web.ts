@@ -22,7 +22,11 @@ export class GeminiWebImages implements ImageGenerator {
   extension(version?:string,phase?:string){this.extensionVersion=version??null;this.phase=phase??null;}
   failure(error:string,httpStatus=0){this.workerFailure={error,http_status:httpStatus,at:Date.now()};}
   navigationFailureAt(stage:string,message:string){this.navigationFailure={stage,message,at:Date.now()};}
-  requestReload(){if(this.tasks.size||this.extensionVersion!=='1.2.3')return false;this.reloadRequested=true;return true;}
+  requestReload(){
+    const [major=0,minor=0,patch=0]=this.extensionVersion?.match(/^(\d+)\.(\d+)\.(\d+)$/)?.slice(1).map(Number)??[];
+    if(this.tasks.size||!(major>1||major===1&&(minor>2||minor===2&&patch>=3)))return false;
+    this.reloadRequested=true;return true;
+  }
   takeReload(){if(!this.reloadRequested||[...this.tasks.values()].some(t=>t.claimed))return false;this.reloadRequested=false;return true;}
   active(id:string){return this.tasks.has(id);}
   heartbeat(ready:boolean){this.seen=Date.now();this.ready=ready;if(ready)for(const task of this.tasks.values())task.ready();}
@@ -82,10 +86,20 @@ export function createGeminiWorker(config:Config,images:GeminiWebImages){
     const {stage,message}=z.object({stage:z.enum(['update','reload']),message:z.string().max(240)}).strict().parse(req.body);
     images.navigationFailureAt(stage,message);return {ok:true};
   });
+  app.post('/probe-generation',async req=>{
+    const {prompt}=z.object({prompt:z.string().trim().min(1).max(1000)}).strict().parse(req.body);
+    if(!images.status().connected||images.status().pending)throw Error('worker_busy_or_offline');
+    const abort=new AbortController(),cancel=()=>abort.abort();req.raw.on('aborted',cancel);
+    try{
+      const image=await images.generate(prompt,abort.signal);
+      return {ok:true,mime_type:image.mime_type,bytes:image.data.length,sha256:createHash('sha256').update(image.data).digest('hex')};
+    }finally{req.raw.off('aborted',cancel);}
+  });
   // Authenticated local diagnostic: fetch an existing Gemini asset, never generate
   // another image or send anything to WeChat. Only bounded metadata is returned.
   app.post('/probe-download',async req=>{
     const {url}=z.object({url:z.string().url().max(8192).refine(value=>{
+      if(/^blob:https:\/\/gemini\.google\.com\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value))return true;
       const parsed=new URL(value);return parsed.protocol==='https:'&&parsed.hostname==='lh3.googleusercontent.com'&&
         !parsed.port&&!parsed.username&&!parsed.password&&/^\/(?:gg-dl|rd-gg-dl)\//.test(parsed.pathname);
     })}).strict().parse(req.body);

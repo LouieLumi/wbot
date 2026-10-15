@@ -252,18 +252,18 @@ test('extension repairs a lost page script, throttles reloads, and never replays
 });
 
 function conversationWorker(state:Record<string,any>={tabId:17}){
-  let url='https://gemini.google.com/app',listener:any,taskActive=true,doc=0,failResult=false,tabId=17,failNavigation=false;
-  const tasks:any[]=[],calls:{path:string;body:any}[]=[],navigations:string[]=[],cancellations:string[]=[];
+  let url='https://gemini.google.com/app',listener:any,taskActive=true,doc=0,failResult=false,tabId=17,failNavigation=false,delayedNavigation=false,pendingUrl='',pendingReads=0;
+  const tasks:any[]=[],calls:{path:string;body:any}[]=[],navigations:string[]=[],cancellations:string[]=[],reloadUrls:string[]=[];
   const event=()=>({addListener(){}});
   const chrome={
     storage:{local:{get:async(keys:string|string[])=>Object.fromEntries((Array.isArray(keys)?keys:[keys]).map(k=>[k,structuredClone(state[k])])),set:async(values:object)=>Object.assign(state,values),remove:async(key:string)=>{delete state[key];}}},
-    tabs:{get:async(id:number)=>{if(id!==tabId)throw Error('tab_closed');return {id:tabId,url,status:'complete'};},
+    tabs:{get:async(id:number)=>{if(id!==tabId)throw Error('tab_closed');if(pendingUrl&&++pendingReads>=3){url=pendingUrl;pendingUrl='';doc++;}return {id:tabId,url,status:'complete',pendingUrl};},
       query:async()=>[{id:tabId,url,status:'complete'}],
-      update:async(_id:number,patch:any)=>{if(patch.url){if(failNavigation)throw Error('tab_temporarily_unavailable');url=patch.url;navigations.push(url);doc++;}},reload:async()=>{doc++;},
+      update:async(_id:number,patch:any)=>{if(patch.url){if(failNavigation)throw Error('tab_temporarily_unavailable');navigations.push(patch.url);if(delayedNavigation){pendingUrl=patch.url;pendingReads=0;}else{url=patch.url;doc++;}}},reload:async()=>{reloadUrls.push(url);pendingUrl='';doc++;},
       sendMessage:async(_id:number,message:any)=>{if(message.kind==='cancel'){cancellations.push(message.id);return {ok:true};}return {ready:true,busy:false,protocol:3,document_id:'doc-'+doc};}},
     runtime:{onInstalled:event(),onStartup:event(),onMessage:{addListener:(fn:any)=>{listener=fn;}}},alarms:{onAlarm:event()},action:{onClicked:event()},
   };
-  const context=vm.createContext({chrome,endpoint:'http://127.0.0.1:3152',token:'test',AbortSignal,
+  const context=vm.createContext({chrome,endpoint:'http://127.0.0.1:3152',token:'test',AbortSignal,setTimeout:(fn:()=>void)=>queueMicrotask(fn),
     fetch:async(raw:string,options:any)=>{
       const path=new URL(raw).pathname,body=JSON.parse(options.body);calls.push({path,body});
       if(path==='/result'&&failResult)return {ok:false,status:503};
@@ -271,9 +271,10 @@ function conversationWorker(state:Record<string,any>={tabId:17}){
     }});
   const source=readFileSync(new URL('../apps/gemini-extension/worker.js',import.meta.url),'utf8').replace("import {endpoint,token} from './connection.js';",'');vm.runInContext(source,context);
   const send=(message:any)=>new Promise<any>(resolve=>listener(message,{tab:{id:tabId},url:'https://gemini.google.com/app'},resolve));
-  return {state,tasks,calls,navigations,cancellations,
+  return {state,tasks,calls,navigations,cancellations,reloadUrls,
     setActive(value:boolean){taskActive=value;},failResult(value:boolean){failResult=value;},setUrl(value:string){url=value;},
     failNavigation(value:boolean){failNavigation=value;},
+    delayNavigation(){delayedNavigation=true;},
     restoreTab(){tabId++;doc++;url='https://gemini.google.com/app#nila-image-worker';},
     allowNavigationRetry(){state.active.last_navigation=Date.now()-6000;},
     tick:()=>vm.runInContext('tick()',context),
@@ -283,6 +284,14 @@ function conversationWorker(state:Record<string,any>={tabId:17}){
     async settle(){await vm.runInContext('operations',context);await vm.runInContext('operations',context);},
   };
 }
+
+test('a reload waits for the new URL to commit instead of cancelling a pending hash navigation',async()=>{
+  const {randomUUID}=await import('node:crypto'),worker=conversationWorker();worker.delayNavigation();
+  const task={id:randomUUID(),session_id:randomUUID(),prompt:'test',expires:Date.now()+60_000};worker.tasks.push(task);
+  await worker.tick();assert.deepEqual(worker.reloadUrls,['https://gemini.google.com/app#nila-image-worker-'+task.id]);
+  assert.equal((await worker.ready()).task.id,task.id);await worker.started(task.id);
+  assert.equal(worker.state.active.phase,'generating');
+});
 
 test('browser routes A then B then A into separate persistent conversations; a new session starts fresh',async()=>{
   const {randomUUID}=await import('node:crypto');const sessionA=randomUUID(),sessionB=randomUUID();
