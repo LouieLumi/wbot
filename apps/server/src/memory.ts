@@ -30,6 +30,7 @@ export class Memories {
     store.db.exec("CREATE TABLE IF NOT EXISTS member_profiles(id TEXT PRIMARY KEY,notes TEXT NOT NULL DEFAULT '')");
     const replyColumns=new Set((store.db.prepare('PRAGMA table_info(reply_context)').all() as {name:string}[]).map(r=>r.name));
     if(!replyColumns.has('memory_draft'))store.db.exec('ALTER TABLE reply_context ADD COLUMN memory_draft TEXT');
+    if(!replyColumns.has('memory_scope'))store.db.exec("ALTER TABLE reply_context ADD COLUMN memory_scope TEXT NOT NULL DEFAULT 'member'");
     for(const {id} of store.db.prepare("SELECT DISTINCT id FROM members WHERE id LIKE 'wxid:%'").all() as {id:string}[])this.ensureProfile('',id);
   }
   private scope(chat:string,id:string){return verifiedMember(id)?{where:'member_id=?',args:[id]}:{where:'chat_id=? AND member_id=?',args:[chat,id]};}
@@ -182,7 +183,7 @@ export class Memories {
     }catch(e){this.store.db.exec('ROLLBACK');throw e;}
   }
   trackImageJob(job:string,member:Member,session:string){this.store.db.prepare('INSERT OR IGNORE INTO image_reply_context VALUES(?,?,?,?,?)').run(job,member.chat_id,member.id,member.revision,session);}
-  stage(job:string,member:Member,user:string,answer:string,draft?:MemoryDraft){this.store.db.prepare('INSERT OR IGNORE INTO reply_context(job_id,chat_id,member_id,revision,user_text,answer,memory_draft) VALUES(?,?,?,?,?,?,?)').run(job,member.chat_id,member.id,member.revision,user,answer,draft?JSON.stringify(draft):null);}
+  stage(job:string,member:Member,user:string,answer:string,draft?:MemoryDraft,scope:'member'|'group'='member'){this.store.db.prepare('INSERT OR IGNORE INTO reply_context(job_id,chat_id,member_id,revision,user_text,answer,memory_draft,memory_scope) VALUES(?,?,?,?,?,?,?,?)').run(job,member.chat_id,member.id,member.revision,user,answer,draft?JSON.stringify(draft):null,scope);}
   valid(job:string){
     const image=this.store.db.prepare('SELECT * FROM image_reply_context WHERE job_id=?').get(job) as any;
     if(image){const m=this.member(image.chat_id,image.member_id);if(!m?.enabled||m.revision!==image.revision||this.imageSession(image.chat_id,image.member_id)!==image.session_id)return false;}
@@ -191,7 +192,9 @@ export class Memories {
   complete(job:string,sent:boolean){
     const r=this.store.db.prepare('SELECT * FROM reply_context WHERE job_id=?').get(job) as any;if(!r){this.store.db.prepare('DELETE FROM image_reply_context WHERE job_id=?').run(job);return;}
     this.store.db.exec('BEGIN');try{
-      if(sent&&this.valid(job)){
+      if(sent&&this.valid(job)&&r.memory_scope==='group'){
+        this.store.db.prepare('INSERT OR IGNORE INTO group_answers VALUES(?,?,?,?,?,?)').run(job,r.chat_id,r.member_id,r.user_text,r.answer,Date.now());
+      }else if(sent&&this.valid(job)){
         this.backend?.commit(memberMemoryKey(r.chat_id,r.member_id),job,r.user_text,r.answer,r.memory_draft?JSON.parse(r.memory_draft):undefined);
         const put=this.store.db.prepare('INSERT INTO turns(chat_id,member_id,role,content,created_at) VALUES(?,?,?,?,?)');
         put.run(r.chat_id,r.member_id,'user',r.user_text,Date.now());put.run(r.chat_id,r.member_id,'assistant',r.answer,Date.now());

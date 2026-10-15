@@ -52,6 +52,10 @@ def run_turn(request, snapshot, profile, configure):
     os.chdir(workspace)
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         from run_agent import AIAgent
+        from hermes_group_recall import GroupRecall
+        archive = request.get('group_archive', {})
+        recall = GroupRecall(archive.get('database', ''), archive.get('chat_id', ''), archive.get('member_id', ''))
+        recall.register()
         from hermes_member_memory import LIMIT
         from tools.memory_tool import MemoryStore
         seed = MemoryStore(LIMIT, LIMIT)
@@ -95,7 +99,7 @@ def run_turn(request, snapshot, profile, configure):
             except (ValueError, AttributeError, TypeError):
                 pass
         agent = AIAgent(provider='custom', base_url=request['base_url'], api_key=request.get('api_key', 'local-ollama'),
-            model=request['model'], enabled_toolsets=['memory', 'search'] if web else ['memory'], quiet_mode=True,
+            model=request['model'], enabled_toolsets=['memory', 'wbot_group', 'search'] if web else ['memory', 'wbot_group'], quiet_mode=True,
             save_trajectories=False, verbose_logging=False, max_iterations=8, max_tokens=8192 if proxy else 512,
             tool_start_callback=tool_started,
             tool_complete_callback=tool_completed,
@@ -105,14 +109,14 @@ def run_turn(request, snapshot, profile, configure):
             run_budget_seconds=150 if web else 90, cwd=str(workspace))
         agent._persist_disabled = True
         try:
-            allowed = {'memory', 'web_search'} if web else {'memory'}
+            allowed = {'memory', 'group_recall', 'web_search'} if web else {'memory', 'group_recall'}
             if set(agent.valid_tool_names) != allowed:
-                raise RuntimeError('unexpected_tools_enabled')
+                raise RuntimeError('unexpected_tools_enabled:' + ','.join(sorted(agent.valid_tool_names)))
             answer = agent.run_conversation(request['content'], system_message=request['system'], conversation_history=history)
             text = answer.get('final_response')
             if not isinstance(text, str) or not text.strip() or len(text) > 4000 or answer.get('interrupted') or answer.get('error'):
                 raise RuntimeError('invalid_hermes_reply')
-            if 'web_search' in used_tools and not sources:
+            if 'web_search' in used_tools and not sources and not recall.used:
                 text = '这次联网搜索没有取得有效结果，请稍后重试或换一个关键词。'
             elif sources and not any(url in text for url in sources):
                 text = text[:3000] + '\n\n来源：\n' + '\n'.join(sources[:2])
@@ -123,12 +127,14 @@ def run_turn(request, snapshot, profile, configure):
                      'user': native.user_entries, 'memory': native.memory_entries}
         finally:
             agent.close()
-    print(json.dumps({'content': text.strip(), 'provider': 'hermes', 'tools': used_tools, 'sources': sources[:5], 'memory': draft}, ensure_ascii=False))
+    print(json.dumps({'content': text.strip(), 'provider': 'hermes', 'tools': used_tools, 'sources': sources[:5],
+                      'memory': None if recall.used else draft, 'memory_scope': 'group' if recall.used else 'member'}, ensure_ascii=False))
 
 if __name__ == '__main__':
     try:
         main()
     except Exception as error:
         # Never print prompts, notes, raw provider responses, or credentials.
-        print(json.dumps({'error': type(error).__name__}), file=sys.stderr)
+        detail = str(error) if str(error).startswith(('unexpected_tools_enabled:', 'hermes_memory_not_loaded', 'invalid_hermes_reply')) else ''
+        print(json.dumps({'error': type(error).__name__, 'detail': detail}), file=sys.stderr)
         raise SystemExit(1)

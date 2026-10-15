@@ -69,6 +69,7 @@ export async function createApi(config:Config,bridge:Bridge) {
   app.get('/api/health',async()=>({ok:true,mode:config.WECHAT_DEVICE_MODE,paused:bridge.paused,auto_reply:bridge.autoReply,
     image:bridge.imageStatus(),web_search:config.HERMES_WEB_SEARCH,
     memory:{provider:bridge.memory.backend?'hermes':'local',scope:'member'},
+    group_memory:{enabled:Boolean(bridge.driver.groupHistory),scope:'group',groups:bridge.groupMemory.states().map(g=>bridge.groupMemory.stats(g.chat_id))},
     reliability:bridge.lastReliability,last_error:bridge.lastError,ai_provider:config.AI_PROVIDER,
     ai_model:config.AI_PROVIDER!=='openclaw'?bridge.models.default():config.OPENCLAW_AGENT_ID,
     openclaw_configured:config.OPENCLAW_ENDPOINT_VERIFIED&&config.OPENCLAW_AGENT_RESTRICTED&&Boolean(config.OPENCLAW_TOKEN)}));
@@ -107,6 +108,7 @@ export async function createApi(config:Config,bridge:Bridge) {
     if(body.model!==undefined)await bridge.models.validate(body.model);await bridge.groupPatch(id,body);return {ok:true};
   });
   app.get('/api/admin/groups/:id/members',async(req)=>{const {id}=groupParams.parse(req.params);return {members:bridge.memory.members(id)};});
+  app.get('/api/admin/groups/:id/history',async(req)=>{const {id}=groupParams.parse(req.params);if(!bridge.memory.group(id))throw new Error('group_not_found');return {stats:bridge.groupMemory.stats(id),messages:bridge.groupMemory.recent(id)};});
   app.get('/api/admin/members',async()=>({members:bridge.memory.allMembers()}));
   const memberParams=z.object({id:z.string().min(1).max(128),member:z.string().min(1).max(128)});
   app.get('/api/admin/groups/:id/members/:member',async(req,res)=>{const {id,member}=memberParams.parse(req.params);const value=bridge.memory.member(id,member);return value?{member:value,history:bridge.memory.history(id,member)}:res.code(404).send({error:'member_not_found'});});

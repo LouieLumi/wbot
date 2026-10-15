@@ -60,6 +60,9 @@ def configure(profile, base_config=None):
             config['web'] = source['web']
     config['memory'] = {'memory_enabled': True, 'user_profile_enabled': True,
                         'memory_char_limit': LIMIT, 'user_char_limit': LIMIT, 'provider': ''}
+    # Expose only the explicitly selected tools directly, without Hermes' lazy
+    # tool-search bridge introducing additional tool entry points.
+    config['tools'] = {'tool_search': {'enabled': 'off'}}
     (profile / 'config.yaml').write_text(yaml.safe_dump(config, allow_unicode=True))
 
 

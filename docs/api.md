@@ -58,3 +58,10 @@ WebSocket 事件包括 `message.received`、`job.updated`、`reply.failed`、`co
 `POST /probe-generation` 使用相同鉴权，接收 `{ "prompt": "画一个红苹果" }`（1–1000 字符），在空闲时创建独立诊断会话，验证提交、生成、下载并返回图片元数据。该入口不接收微信目标，也不会创建微信群发送任务。
 
 `POST /navigation-failure` 记录扩展导航或刷新失败的阶段与限长错误信息，扩展会移除其中的 URL。`POST /reload-extension` 仅允许受支持且空闲的扩展重载已安装代码，鉴权方式相同；不会增加权限或修改登录信息，忙碌时返回 409。
+
+
+### 群聊文字记录
+
+`GET /api/admin/groups/:id/history`（管理台鉴权）：返回 `stats`（采集起点、最后同步、数量、是否还有待同步记录、错误状态）与最近 100 条 `messages`。个人记忆接口保持不变。
+
+手机内部接口 `GET /history?chat_id=…&since=…&after=…&source=…` 仅接受已授权群，返回来源摘要、游标、`has_more` 和最多 100 条文字。`since` 为毫秒时间，`after` 为本地消息 ID；该接口只读，不触发回复。

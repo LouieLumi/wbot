@@ -297,6 +297,50 @@ public final class LocalBridge {
         } catch(Throwable ignored) { }
     }
 
+    /** Fixed read-only query, bounded and restricted to an explicitly authorized group.
+     * The host commits this local-row cursor alongside the archive. It is independent
+     * of the transient trigger ring, so downtime never turns old chat into replies. */
+    private JSONObject history(URI uri) throws Exception {
+        Map<String,String> params=new HashMap<>();
+        if(uri.getRawQuery()!=null)for(String pair:uri.getRawQuery().split("&")){
+            String[] parts=pair.split("=",2);
+            params.put(URLDecoder.decode(parts[0],"UTF-8"),parts.length==2?URLDecoder.decode(parts[1],"UTF-8"):"");
+        }
+        String group=params.get("chat_id"),requestedSource=params.get("source");
+        if(group==null||!group.matches("[A-Za-z0-9_\\-]+@chatroom")||!authorized.contains(group)||!groups.containsKey(group))throw new SecurityException("group_not_authorized");
+        long since=Long.parseLong(params.get("since")),after=Long.parseLong(params.get("after"));
+        if(since<0||since>System.currentTimeMillis()+60000||after<0)throw new IllegalArgumentException("invalid_history_cursor");
+        for(Map.Entry<String,Object> entry:databases.entrySet()){
+            try {
+                Object database=entry.getValue();
+                try(Cursor known=query(database,"SELECT username FROM rcontact WHERE username=? LIMIT 1",group)){if(!known.moveToFirst())continue;}
+                StringBuilder hex=new StringBuilder();for(byte b:MessageDigest.getInstance("SHA-256").digest(entry.getKey().getBytes(StandardCharsets.UTF_8)))hex.append(String.format(Locale.ROOT,"%02x",b&255));
+                String source=hex.toString();long cursor=source.equals(requestedSource)?after:0;
+                JSONArray rows=new JSONArray();int scanned=0;Map<String,String> displayNames=new HashMap<>();
+                try(Cursor records=query(database,"SELECT msgId,createTime,content FROM message WHERE talker=? AND type=1 AND isSend=0 AND msgId>? AND createTime>=? AND createTime<=? ORDER BY msgId ASC LIMIT 100",group,cursor,since,System.currentTimeMillis())){
+                    while(records.moveToNext()){
+                        scanned++;cursor=records.getLong(0);long timestamp=records.getLong(1);String raw=records.getString(2);
+                        if(raw==null)continue;int split=raw.indexOf(":\n");if(split<=0||split>128)continue;
+                        String sender=raw.substring(0,split),content=raw.substring(split+2);
+                        if(!sender.matches("[A-Za-z0-9_@.\\-]+"))continue;
+                        String name=displayNames.get(sender);
+                        if(name==null){
+                            name=sender;
+                            try(Cursor contact=query(database,"SELECT nickname FROM rcontact WHERE username=? LIMIT 1",sender)){
+                                if(contact.moveToFirst()&&contact.getString(0)!=null&&!contact.getString(0).isEmpty())name=contact.getString(0);
+                            }catch(Throwable ignored) { }
+                            displayNames.put(sender,name);
+                        }
+                        rows.put(new JSONObject().put("local_id",cursor).put("sender_id",sender).put("sender",name.substring(0,Math.min(128,name.length())))
+                            .put("content",content.substring(0,Math.min(8000,content.length()))).put("timestamp",timestamp).put("truncated",content.length()>8000));
+                    }
+                }
+                return new JSONObject().put("chat_id",group).put("source",source).put("cursor",cursor).put("has_more",scanned==100).put("messages",rows);
+            }catch(Throwable error){Log.w("NilaWeChatHook","group_history_failed:"+error.getClass().getSimpleName());}
+        }
+        throw new IllegalStateException("history_database_unavailable");
+    }
+
     private JSONObject send(JSONObject request,boolean signupAck) throws Exception {
         String group=request.getString("chat_id"), content=request.getString("content"), id=request.getString("id");
         if(!id.matches("[A-Za-z0-9_:.\\-]{8,150}") || content.trim().isEmpty() || content.length()>2000) throw new IllegalArgumentException("invalid_send");
@@ -493,7 +537,7 @@ public final class LocalBridge {
                 URI uri=new URI(request[1]); JSONObject result;
                 if(request[0].equals("GET")&&uri.getPath().equals("/status")) {
                     result=new JSONObject().put("connected",true).put("mode","android_hook").put("generation",generation)
-                        .put("api_version",5).put("text_receipts","persistent").put("identity_supported",true).put("image_supported",true).put("signup_supported",true).put("database_handles",databases.size()).put("authorized_groups",authorized.size()).put("events",sequence);
+                        .put("api_version",6).put("group_history_supported",true).put("text_receipts","persistent").put("identity_supported",true).put("image_supported",true).put("signup_supported",true).put("database_handles",databases.size()).put("authorized_groups",authorized.size()).put("events",sequence);
                 } else if(request[0].equals("POST")&&uri.getPath().equals("/identity/resolve")) {
                     result=resolveIdentity(new JSONObject(new String(bytes,StandardCharsets.UTF_8)));
                 } else if(request[0].equals("GET")&&uri.getPath().equals("/groups")) {
@@ -504,6 +548,8 @@ public final class LocalBridge {
                     result=acknowledgeSignup(new JSONObject(new String(bytes,StandardCharsets.UTF_8)));
                 } else if(request[0].equals("POST")&&uri.getPath().equals("/authorization")) {
                     result=authorize(new JSONObject(new String(bytes,StandardCharsets.UTF_8)));
+                } else if(request[0].equals("GET")&&uri.getPath().equals("/history")) {
+                    result=history(uri);
                 } else if(request[0].equals("GET")&&uri.getPath().equals("/events")) {
                     String query=uri.getQuery(); long after=query!=null&&query.matches("after=[0-9]+")?Long.parseLong(query.substring(6)):0;
                     JSONArray batch=new JSONArray();long oldest,cursor;

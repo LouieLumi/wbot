@@ -11,6 +11,7 @@ import {hostLocked} from './power.js';
 import {GeminiImages,ImageGenerationError,imageErrorReply,type ImageGenerator} from './images.js';
 import {WechatAdmin} from './wechat-admin.js';
 import {ImageQueue,type ImageRequest} from './image-queue.js';
+import {GroupMemory} from './group-memory.js';
 
 export class WindowTracker {
   private previous:Snapshot|null=null;
@@ -35,12 +36,13 @@ export class Bridge extends EventEmitter {
   private imageRequests=new Map<string,{member:Member;session:string;controller:AbortController}>();
   private commandChain:Promise<void>=Promise.resolve();private pendingCommands=0;private lastCommand=new Map<string,number>();
   readonly wechatAdmin:WechatAdmin;
+  readonly groupMemory:GroupMemory;
   readonly imageQueue:ImageQueue;private imageQueueRecovered=false;
   private lastReply=new Map<string,number>();private abort=new AbortController();private closed=false;
   paused:boolean;autoReply:boolean;lastReliability='not_started';lastError:string|null=null;activeChat:string|null=null;
   constructor(readonly config:Config,readonly driver:DeviceAdapter,readonly store:Store,private responder:Responder,
     readonly memory=new Memories(store),readonly models=new Models(config,store),private images:ImageGenerator=new GeminiImages(config)){
-    super();this.imageQueue=new ImageQueue(store);this.wechatAdmin=new WechatAdmin(config,store);this.paused=store.get('paused')!=='false';this.autoReply=store.get('auto_reply')?store.get('auto_reply')==='true':config.WECHAT_AUTO_REPLY;
+    super();this.groupMemory=new GroupMemory(store);this.imageQueue=new ImageQueue(store);this.wechatAdmin=new WechatAdmin(config,store);this.paused=store.get('paused')!=='false';this.autoReply=store.get('auto_reply')?store.get('auto_reply')==='true':config.WECHAT_AUTO_REPLY;
   }
   emitEvent(event:Record<string,unknown>){this.emit('event',event);}
   get deviceBusy(){return this.busy;}
@@ -56,6 +58,9 @@ export class Bridge extends EventEmitter {
   async groups(){
     this.memory.sync(await this.driver.chats(),this.config.WECHAT_ALLOWED_CHAT_IDS);
     const groups=this.memory.groups();
+    // Authorization persists through transport loss; an offline group must not
+    // reset its capture start and discard the unsynchronized interval.
+    this.groupMemory.authorize(groups.filter(g=>g.enabled).map(g=>g.id));
     await this.driver.setAuthorized?.(groups.filter(g=>g.enabled&&g.verified).map(g=>g.id));
     await this.wechatAdmin.resolve(this.driver);
     if(!this.imageQueueRecovered&&!this.paused&&this.autoReply){
@@ -66,6 +71,7 @@ export class Bridge extends EventEmitter {
   }
   async groupPatch(id:string,patch:{enabled?:boolean;model?:string;paused?:boolean}){
     this.memory.groupPatch(id,patch);this.cancelStaleImages();
+    this.groupMemory.authorize(this.memory.groups().filter(g=>g.enabled).map(g=>g.id));
     // Persist first; a phone reconnect will reapply the current permissions.
     await this.groups();
   }
@@ -127,6 +133,18 @@ export class Bridge extends EventEmitter {
         for(const request of requests){const job=this.memory.requestSignup(request);if(job)this.emitEvent({event:'group.signup',chat_id:request.chat_id,job_id:job.id});}
       }
       if(this.driver.pollEvents){
+        // Archive ordinary text through a separate read-only cursor. Historical
+        // records never enter receive(), so reconnects cannot replay old triggers.
+        if(this.driver.groupHistory)for(const group of groups){
+          for(let page=0;page<3&&!this.paused;page++){
+            const state=this.groupMemory.state(group.id);if(!state?.enabled)break;
+            try{
+              const result=await this.driver.groupHistory(group.id,state.since,state.cursor,state.source);
+              if(this.paused||!this.isAllowed(group.id))break;
+              this.groupMemory.accept(group.id,result);if(!result.has_more)break;
+            }catch{this.groupMemory.failed(group.id);break;}
+          }
+        }
         const result=await this.driver.pollEvents();if(this.paused)return;
         this.lastReliability=result.reliability;this.lastError=null;
         for(const group of groups)this.memory.observed(group.id);
@@ -232,7 +250,7 @@ export class Bridge extends EventEmitter {
         const limit=this.config.WECHAT_DEVICE_MODE==='android_hook'?2000:100;
         if(answer.length>limit)answer=answer.slice(0,limit-9)+'…（已截短）';
         const job=await this.enqueue(message.chat_id,answer,'reply:'+message.message_id);
-        if(!isCommand)this.memory.stage(job.id,member,text,answer,typeof generated==='string'?undefined:generated.memory);
+        if(!isCommand)this.memory.stage(job.id,member,text,answer,typeof generated==='string'?undefined:generated.memory,typeof generated!=='string'&&generated.memory_scope==='group'?'group':'member');
         this.lastReply.set(message.chat_id,Date.now());
       }catch(e){
         const reason=e instanceof ImageGenerationError?e.reason:e instanceof Error&&e.message==='model_not_installed'?'model_not_installed':'agent_unavailable_or_not_configured';

@@ -20,4 +20,5 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - run: python3 -m unittest discover -s tests -p group_recall_test.py -v
       - run: node --check apps/gemini-extension/page.js && node --check apps/gemini-extension/worker.js

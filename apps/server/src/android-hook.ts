@@ -4,7 +4,7 @@ import {resolve} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {z} from 'zod';
 import type {Config} from './config.js';
-import type {Chat,DeviceAdapter,Message,SendResult,Snapshot,SignupRequest,GeneratedImage} from '../../../packages/shared/types.js';
+import type {Chat,DeviceAdapter,Message,SendResult,Snapshot,SignupRequest,GeneratedImage,GroupHistory} from '../../../packages/shared/types.js';
 import {validateImage} from './images.js';
 
 const exec=promisify(execFile);
@@ -64,6 +64,12 @@ export class AndroidHookDriver implements DeviceAdapter {
   }
   async snapshot():Promise<Snapshot>{throw new Error('android_hook_has_no_visual_snapshot');}
   resetEvents(){this.baseline=true;this.epoch++;}
+  async groupHistory(id:string,since:number,after:number,source:string):Promise<GroupHistory>{
+    const query=new URLSearchParams({chat_id:id,since:String(since),after:String(after),source});
+    return z.object({chat_id:z.literal(id),source:z.string().regex(/^[a-f0-9]{64}$/),cursor:z.number().int().nonnegative().safe(),has_more:z.boolean(),messages:z.array(z.object({
+      local_id:z.number().int().positive().safe(),sender_id:z.string().regex(/^[\w@.\-]{1,128}$/),sender:z.string().min(1).max(128),content:z.string().max(8000),timestamp:z.number().int().positive().safe(),truncated:z.boolean()
+    })).max(100)}).parse(await this.call('/history?'+query,undefined,8000));
+  }
   async pollEvents():Promise<{messages:Message[];reliability:string}>{
     const epoch=this.epoch,now=Date.now();
     const data=batch.parse(await this.call('/events?after='+this.cursor));

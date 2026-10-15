@@ -12,6 +12,8 @@ export type JobState = 'queued' | 'running' | 'sent' | 'failed' | 'uncertain';
 export interface SendResult { state: 'sent' | 'failed' | 'uncertain'; reason: string }
 export interface GeneratedImage {mime_type:'image/png'|'image/jpeg'|'image/webp';data:Uint8Array}
 export interface SignupRequest { request_id:string; chat_id:string; chat_name:string; requested_at:number }
+export interface GroupText {local_id:number;sender_id:string;sender:string;content:string;timestamp:number;truncated:boolean}
+export interface GroupHistory {chat_id:string;source:string;cursor:number;has_more:boolean;messages:GroupText[]}
 export interface Job { id: string; chat_id: string; content: string; state: JobState; reason: string; created_at: number; updated_at: number }
 export interface DeviceAdapter {
   status(): Promise<Record<string, unknown>>;
@@ -19,6 +21,7 @@ export interface DeviceAdapter {
   snapshot(chat?:Chat): Promise<Snapshot>;
   register?(name:string):Promise<Chat>;
   pollEvents?(): Promise<{messages:Message[];reliability:string}>;
+  groupHistory?(chat:string,since:number,after:number,source:string):Promise<GroupHistory>;
   resetEvents?(): void;
   signupRequests?():Promise<SignupRequest[]>;
   acknowledgeSignup?(request:SignupRequest):Promise<SendResult>;
