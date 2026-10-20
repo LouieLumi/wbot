@@ -2,6 +2,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import type {Store} from './store.js';
 import type {Chat,SignupRequest} from '../../../packages/shared/types.js';
 import {memberMemoryKey,verifiedMember,type MemberMemoryBackend,type MemoryDraft} from './hermes-memory.js';
+import type {ImageSessionContext} from './images.js';
 
 export interface Group extends Chat {enabled:boolean;paused:boolean;model:string;last_poll:number;last_message:number;error:string;signup_pending:boolean;requested_at:number}
 export interface Member {chat_id:string;id:string;name:string;avatar_hash:string;notes:string;summary?:string;memory_backend?:string;memory_scope?:'member'|'group';model:string;enabled:boolean;revision:number;last_seen:number;identity:'wechat_id'|'visual'|'name_only';turn_count?:number;groups?:{id:string;name:string}[]}
@@ -28,6 +29,8 @@ export class Memories {
     if(!columns.has('requested_at'))store.db.exec('ALTER TABLE groups ADD COLUMN requested_at INTEGER NOT NULL DEFAULT 0');
     if(!columns.has('paused'))store.db.exec('ALTER TABLE groups ADD COLUMN paused INTEGER NOT NULL DEFAULT 0');
     store.db.exec("CREATE TABLE IF NOT EXISTS member_profiles(id TEXT PRIMARY KEY,notes TEXT NOT NULL DEFAULT '')");
+    store.db.exec(`CREATE TABLE IF NOT EXISTS image_identities(member_id TEXT PRIMARY KEY,wechat_id TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS member_image_sessions(owner TEXT PRIMARY KEY,session_id TEXT NOT NULL UNIQUE,title TEXT NOT NULL,retired_sessions TEXT NOT NULL DEFAULT '[]');`);
     const replyColumns=new Set((store.db.prepare('PRAGMA table_info(reply_context)').all() as {name:string}[]).map(r=>r.name));
     if(!replyColumns.has('memory_draft'))store.db.exec('ALTER TABLE reply_context ADD COLUMN memory_draft TEXT');
     if(!replyColumns.has('memory_scope'))store.db.exec("ALTER TABLE reply_context ADD COLUMN memory_scope TEXT NOT NULL DEFAULT 'member'");
@@ -125,6 +128,7 @@ export class Memories {
   identifyWechat(chat:string,wxid:string,name:string):Member {
     if(!/^[\w@.\-]{1,128}$/.test(wxid))throw new Error('invalid_member_id');
     const id='wxid:'+createHash('sha256').update(wxid).digest('hex');
+    this.store.db.prepare('INSERT OR REPLACE INTO image_identities VALUES(?,?)').run(id,wxid);
     this.store.db.prepare("INSERT INTO members(chat_id,id,name,avatar_hash,last_seen) VALUES(?,?,?,'',?) ON CONFLICT(chat_id,id) DO UPDATE SET name=excluded.name,last_seen=excluded.last_seen").run(chat,id,name,Date.now());
     return this.member(chat,id)!;
   }
@@ -169,16 +173,36 @@ export class Memories {
   }
   imageSession(chat:string,id:string):string{
     if(!this.member(chat,id))throw new Error('member_not_found');
-    this.store.db.prepare('INSERT OR IGNORE INTO image_sessions VALUES(?,?,?)').run(chat,id,randomUUID());
-    return (this.store.db.prepare('SELECT session_id FROM image_sessions WHERE chat_id=? AND member_id=?').get(chat,id) as {session_id:string}).session_id;
+    const owner=memberMemoryKey(chat,id);
+    // Adopt an existing conversation once; a verified WeChat ID owns one session
+    // across groups. Unverified legacy identities remain scoped to their group.
+    const scope=this.scope(chat,id);
+    const legacy=this.store.db.prepare(`SELECT session_id FROM image_sessions WHERE ${scope.where} ORDER BY rowid DESC LIMIT 1`).get(...scope.args) as {session_id:string}|undefined;
+    const wxid=(this.store.db.prepare('SELECT wechat_id FROM image_identities WHERE member_id=?').get(id) as {wechat_id:string}|undefined)?.wechat_id;
+    const title=(wxid??id)+'的对话';
+    this.store.db.prepare('INSERT OR IGNORE INTO member_image_sessions(owner,session_id,title) VALUES(?,?,?)').run(owner,legacy?.session_id??randomUUID(),title);
+    if(wxid)this.store.db.prepare('UPDATE member_image_sessions SET title=? WHERE owner=?').run(title,owner);
+    return (this.store.db.prepare('SELECT session_id FROM member_image_sessions WHERE owner=?').get(owner) as {session_id:string}).session_id;
+  }
+  imageContext(chat:string,id:string):ImageSessionContext{
+    this.imageSession(chat,id);
+    const row=this.store.db.prepare('SELECT title,retired_sessions FROM member_image_sessions WHERE owner=?').get(memberMemoryKey(chat,id)) as {title:string;retired_sessions:string};
+    return {title:row.title,retired_sessions:JSON.parse(row.retired_sessions)};
+  }
+  imageSessionReady(chat:string,id:string,session:string){
+    this.store.db.prepare("UPDATE member_image_sessions SET retired_sessions='[]' WHERE owner=? AND session_id=?").run(memberMemoryKey(chat,id),session);
   }
   newImageSession(chat:string,id:string){
     if(!this.member(chat,id))throw new Error('member_not_found');
+    const old=this.imageSession(chat,id),context=this.imageContext(chat,id),scope=this.scope(chat,id);
+    const previous=this.store.db.prepare(`SELECT session_id FROM image_sessions WHERE ${scope.where}`).all(...scope.args) as {session_id:string}[];
+    const retired=[...new Set([...context.retired_sessions,old,...previous.map(r=>r.session_id)])];
     this.store.db.exec('BEGIN');try{
-      this.store.db.prepare('INSERT INTO image_sessions VALUES(?,?,?) ON CONFLICT(chat_id,member_id) DO UPDATE SET session_id=excluded.session_id').run(chat,id,randomUUID());
-      this.store.db.prepare("UPDATE jobs SET state='failed',reason='image_session_reset',updated_at=? WHERE state='queued' AND id IN (SELECT job_id FROM image_reply_context WHERE chat_id=? AND member_id=?)").run(Date.now(),chat,id);
-      this.store.db.prepare("DELETE FROM reply_context WHERE job_id IN (SELECT i.job_id FROM image_reply_context i JOIN jobs j ON j.id=i.job_id WHERE i.chat_id=? AND i.member_id=? AND j.state='failed' AND j.reason='image_session_reset')").run(chat,id);
-      this.store.db.prepare("DELETE FROM image_reply_context WHERE chat_id=? AND member_id=? AND job_id IN (SELECT id FROM jobs WHERE state='failed' AND reason='image_session_reset')").run(chat,id);
+      this.store.db.prepare('UPDATE member_image_sessions SET session_id=?,retired_sessions=? WHERE owner=?').run(randomUUID(),JSON.stringify(retired),memberMemoryKey(chat,id));
+      this.store.db.prepare(`DELETE FROM image_sessions WHERE ${scope.where}`).run(...scope.args);
+      this.store.db.prepare(`UPDATE jobs SET state='failed',reason='image_session_reset',updated_at=? WHERE state='queued' AND id IN (SELECT job_id FROM image_reply_context WHERE ${scope.where})`).run(Date.now(),...scope.args);
+      this.store.db.prepare(`DELETE FROM reply_context WHERE job_id IN (SELECT job_id FROM image_reply_context WHERE ${scope.where}) AND job_id IN (SELECT id FROM jobs WHERE state='failed' AND reason='image_session_reset')`).run(...scope.args);
+      this.store.db.prepare(`DELETE FROM image_reply_context WHERE ${scope.where} AND job_id IN (SELECT id FROM jobs WHERE state='failed' AND reason='image_session_reset')`).run(...scope.args);
       this.store.db.exec('COMMIT');
     }catch(e){this.store.db.exec('ROLLBACK');throw e;}
   }

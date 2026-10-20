@@ -1,5 +1,5 @@
 (() => {
-  let running=false,activeTask,generationAbort;
+  let running=false,activeTask,generationAbort,activeAnchor;
   const documentId=Date.now().toString(36)+Math.random().toString(36).slice(2);
   const editor=()=>document.querySelector('[contenteditable="true"][role="textbox"]');
   const visible=e=>e instanceof HTMLElement&&e.getClientRects().length>0;
@@ -58,6 +58,54 @@
     observer.observe(document.documentElement,{subtree:true,childList:true,attributes:true,characterData:true});
     document.addEventListener('load',probe,true);probe();
   });
+  const currentConversation=()=>/^\/app\/[A-Za-z0-9_-]+$/.test(location.pathname)?'https://gemini.google.com'+location.pathname:null;
+  const currentLink=()=>[...document.querySelectorAll('a[href]')].find(a=>a.getAttribute('href')===location.pathname);
+  const dialog=()=>[...document.querySelectorAll('[role="dialog"]')].find(visible);
+  async function conversationMenu(item,error){
+    const menu=await waitFor(()=>buttons().find(b=>/^(打开对话操作菜单。?|Open conversation actions menu\.?)$/i.test((b.getAttribute('aria-label')||'').trim())),15_000,error);
+    menu.click();
+    const entry=await waitFor(()=>[...document.querySelectorAll('[role="menuitem"]')].find(e=>visible(e)&&item.test(e.innerText.trim())),5000,error);
+    entry.click();await waitFor(dialog,5000,error);
+  }
+  async function renameConversation(title){
+    if(!title)return;
+    const url=currentConversation();if(!url)throw Error('conversation_rename_failed');
+    const named=()=>currentLink()?.textContent.trim()===title||document.title===title+' - Google Gemini';
+    if(named())return;
+    await conversationMenu(/^(重命名|Rename)$/i,'conversation_rename_failed');
+    const input=await waitFor(()=>dialog()?.querySelector('input[type="text"]'),15_000,'conversation_rename_failed');
+    const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+    setter.call(input,title);input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));
+    const save=await waitFor(()=>[...dialog()?.querySelectorAll('button')||[]].find(b=>!b.disabled&&/^(重命名|Rename)$/i.test(b.innerText.trim())),5000,'conversation_rename_failed');
+    if(currentConversation()!==url||input.value!==title)throw Error('conversation_rename_failed');
+    save.click();
+    await waitFor(()=>!dialog()&&currentConversation()===url&&named(),15_000,'conversation_rename_failed',300);
+  }
+  async function deleteConversation(task){
+    const expected=task.page_url.split('#')[0];
+    await waitFor(()=>currentConversation()===expected&&document.querySelectorAll('user-query').length>0&&!stop(),20_000,'conversation_delete_failed',300);
+    await conversationMenu(/^(删除|Delete)$/i,'conversation_delete_failed');
+    const confirm=await waitFor(()=>[...dialog()?.querySelectorAll('button')||[]].find(b=>!b.disabled&&/^(删除|Delete)$/i.test(b.innerText.trim())),5000,'conversation_delete_failed');
+    if(currentConversation()!==expected||!dialog()||!/(删除对话|Delete chat|Delete conversation)/i.test(dialog().innerText))throw Error('conversation_delete_failed');
+    confirm.click();
+    const path=new URL(expected).pathname;
+    await waitFor(()=>!dialog()&&currentConversation()!==expected&&![...document.querySelectorAll('a[href]')].some(a=>a.getAttribute('href')===path),15_000,'conversation_delete_failed',500);
+  }
+  async function bindConversation(task){
+    if(!task.conversation_title)return;
+    // Gemini can keep /app while generating the first response, assigning its
+    // persistent URL only at the end. The submitted turn already owns this task;
+    // wait within its generation budget instead of abandoning it after 15s.
+    const url=await waitFor(currentConversation,Math.max(1000,task.expires-Date.now()-5000),'timeout');
+    const deadline=Date.now()+5000;
+    while(Date.now()<deadline&&!generationAbort.signal.aborted){
+      const result=await chrome.runtime.sendMessage({kind:'conversation',id:task.id,document_id:documentId,pageUrl:url});
+      if(result?.ok)return;
+      if(!result?.pending||currentConversation()!==url)throw Error('page_changed');
+      await new Promise(resolve=>setTimeout(resolve,100));
+    }
+    throw Error('page_changed');
+  }
   async function submitPrompt(task){
     const expected=task.page_url?.replace('https://gemini.google.com','')||'/app#nila-image-worker-'+task.id;
     const [expectedPath,expectedHash]=expected.split('#');
@@ -78,7 +126,7 @@
       return !!editor()&&!stop();
     },20_000,'login_required',500);
     let input=editor();if(!input)throw Error('login_required');
-    const text='请生成一张图片，不要仅用文字回答，也不要拼图。图片内容：\n'+task.prompt;
+    const text=task.operation==='reset'?task.prompt:'请生成一张图片，不要仅用文字回答，也不要拼图。图片内容：\n'+task.prompt;
     const previous=new Set(document.querySelectorAll('model-response'));
     const queries=new Set(document.querySelectorAll('user-query'));
     const queryCount=queries.size;
@@ -153,23 +201,40 @@
     }
     throw failure;
   }
-  const status=()=>({ready:!!editor()&&!stop(),busy:running,protocol:3,document_id:documentId});
+  const status=()=>({ready:!!editor()&&!stop(),busy:running,protocol:4,document_id:documentId});
   chrome.runtime.onMessage.addListener((m,_,reply)=>{
     if(m.kind==='status')reply(status());
+    if(m.kind==='capture-conversation'&&m.id===activeTask){
+      const query=activeAnchor&&[...document.querySelectorAll('user-query')][activeAnchor.index];
+      reply({url:query&&queryText(query.innerText).includes(activeAnchor.text)?currentConversation():null,document_id:documentId});
+    }
     if(m.kind==='cancel'&&m.id===activeTask){generationAbort?.abort();stop()?.click();reply({ok:true});}
   });
   async function generate(task){
-    running=true;activeTask=task.id;generationAbort=new AbortController();let result;
+    running=true;activeTask=task.id;generationAbort=new AbortController();let result,step='start';
     try{
       if(!editor())throw Error('login_required');
       const accepted=await chrome.runtime.sendMessage({kind:'started',id:task.id,document_id:documentId});
       if(!accepted?.ok)throw Error('page_changed');
       let blob;
-      if(task.image_url){
+      if(task.operation==='delete'){
+        step='delete';
+        await deleteConversation(task);result={id:task.id,ok:true,deleted:true};
+      }else if(task.image_url){
+        step='download';
         blob=await downloadImage(()=>({src:task.image_url}),generationAbort.signal,task.expires);
       }else{
+        if(task.conversation_title&&currentConversation()){
+          step='rename';
+          await waitFor(()=>document.querySelectorAll('user-query').length>0&&!stop(),20_000,'page_changed');
+          await renameConversation(task.conversation_title);
+        }
         // Page text is data. Only this request's submitted turn is read.
-        const anchor=await submitPrompt(task);let conversationPath=/^\/app\/[^/]+$/.test(location.pathname)?location.pathname:undefined;
+        step='submit';const anchor=await submitPrompt(task);activeAnchor=anchor;
+        step='bind';
+        await bindConversation(task);
+        step='response';
+        let conversationPath=/^\/app\/[^/]+$/.test(location.pathname)?location.pathname:undefined;
         const found=await waitFor(()=>{
           if(/^\/app\/[^/]+$/.test(location.pathname)){
             if(conversationPath&&location.pathname!==conversationPath)throw Error('page_changed');
@@ -177,21 +242,24 @@
           }else if(conversationPath)throw Error('page_changed');
           return readResponse(anchor);
         },Math.max(1000,task.expires-Date.now()-5000));
-        if(found.text)result={id:task.id,ok:false,error:'text_response',text:found.text};
-        else blob=await downloadImage(()=>readResponse(anchor)?.image,generationAbort.signal,task.expires);
+        if(task.operation==='reset')result={id:task.id,ok:true,reset_complete:true};
+        else if(found.text)result={id:task.id,ok:false,error:'text_response',text:found.text};
+        else {step='download';blob=await downloadImage(()=>readResponse(anchor)?.image,generationAbort.signal,task.expires);}
+        step='rename';
+        await renameConversation(task.conversation_title);
       }
       if(blob){
         const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(blob);});
         result={id:task.id,ok:true,mime_type:blob.type,data};
       }
-    }catch(e){result={id:task.id,ok:false,error:['login_required','quota','timeout','page_changed','submission_failed','download_failed'].includes(e.message)?e.message:'generation_failed',...(e.message==='download_failed'?{download_status:e.download_status||0}:{})};}
+    }catch(e){result={id:task.id,ok:false,error:['login_required','quota','timeout','page_changed','submission_failed','download_failed','conversation_rename_failed','conversation_delete_failed'].includes(e.message)?e.message:'generation_failed',...(e.message==='download_failed'?{download_status:e.download_status||0}:{})};}
     try{
       while(!generationAbort.signal.aborted&&Date.now()<task.expires){
-        const ack=await chrome.runtime.sendMessage({kind:'result',result,pageUrl:location.href,document_id:documentId}).catch(()=>null);
+        const ack=await chrome.runtime.sendMessage({kind:'result',result,step,submitted:Boolean(activeAnchor),pageUrl:location.href,document_id:documentId}).catch(()=>null);
         if(ack?.ok||ack?.ignored||ack?.expired)break;
         await new Promise(resolve=>setTimeout(resolve,2000));
       }
-    }finally{running=false;activeTask=undefined;generationAbort=undefined;}
+    }finally{running=false;activeTask=undefined;activeAnchor=undefined;generationAbort=undefined;}
     void ready();
   }
   async function ready(){

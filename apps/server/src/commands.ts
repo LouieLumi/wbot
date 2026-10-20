@@ -1,7 +1,7 @@
 import type {Memories,Member} from './memory.js';
 import type {Models} from './models.js';
 
-const features=['/img 提示词 — 在我的生图对话中生成图片','/newimg — 新建我的生图对话','/signup — 申请群使用权限'];
+const features=['/img 提示词 — 在我的生图对话中生成图片','/newimg — 删除旧生图对话并新建','/signup — 申请群使用权限'];
 const personal=['/memory — 查看我的记忆状态','/remember 内容 — 添加我的长期记忆','/forget — 清空我的长期记忆','/reset — 重置我的全部记忆'];
 const management=['/models — 查看模型列表','/model 模型名 — 切换本群模型','/model default — 本群跟随默认模型','/status — 查看本群状态','/new — 新建我的会话','/stop — 停用本群回复','/start — 启用本群回复'];
 export const memberHelp=['Nila · 功能菜单',...features,'','我的记忆',...personal,'','/help 或 /menu — 查看菜单'].join('\n');

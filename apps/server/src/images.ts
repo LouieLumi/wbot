@@ -2,7 +2,12 @@ import type {Config} from './config.js';
 import type {GeneratedImage} from '../../../packages/shared/types.js';
 
 export const maxImageBytes=8*1024*1024;
-export interface ImageGenerator {generate(prompt:string,signal:AbortSignal,sessionId?:string):Promise<GeneratedImage>;status?():unknown}
+export interface ImageSessionContext {title:string;retired_sessions:string[]}
+export interface ImageGenerator {
+  generate(prompt:string,signal:AbortSignal,sessionId?:string,context?:ImageSessionContext):Promise<GeneratedImage>;
+  resetSession?(sessionId:string,context:ImageSessionContext,signal:AbortSignal):Promise<void>;
+  status?():unknown;
+}
 
 export class ImageGenerationError extends Error {
   constructor(readonly reason:'image_quota_exhausted'|'image_rate_limited'|'image_auth_failed'|'image_service_unavailable'|'image_browser_offline'|'image_browser_timeout'|'image_submission_failed'|'image_text_response'|'image_download_failed',readonly httpStatus:number,readonly retryAt?:number){super(reason);}

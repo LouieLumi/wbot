@@ -10,7 +10,7 @@ Android 微信模块监听本版本的消息数据库写入，提取授权群中
 
 Bridge 协调入站去重、授权、统一管理员、成员记忆、命令与发送队列。普通文字和图片分别排队；一组图片任务不会阻塞普通文字回复。设备发送串行执行。
 
-SQLite 表包含 `groups`、`members`、`turns`、`jobs`、`reply_context`、`job_images`、`image_sessions`、`image_reply_context` 与设置、鉴权相关表。成员按真实微信账号派生 ID 跨群共享个人记忆；昵称改变不合并或覆盖其他人的数据。修改或重置记忆增加 revision，使尚未发送的旧回答失效。
+SQLite 表包含 `groups`、`members`、`turns`、`jobs`、`reply_context`、`job_images`、旧版 `image_sessions`、`member_image_sessions`、`image_identities`、`image_reply_context` 与设置、鉴权相关表。成员按真实微信账号派生 ID 跨群共享个人记忆；昵称改变不合并或覆盖其他人的数据。修改或重置记忆增加 revision，使尚未发送的旧回答失效。
 
 代码模式的 `sent` 需要手机端检查微信消息状态为 2 且服务器消息 ID 存在。发送预约先落盘，相同任务 ID 重用原回执；网络中断或进程重启留下的模糊状态标为 `uncertain`，不自动重发。只有已确认且记忆版本有效的回答提交到上下文。
 
@@ -22,11 +22,11 @@ Ollama 直接调用本机 `/api/chat`。Hermes 在独立 Python 子进程执行�
 
 ## 图片
 
-服务器向鉴权的本机图片 worker 分配随机任务 ID 与会话 ID。Chrome 扩展保存 `会话 ID → Gemini 对话 URL`，一个专用标签页串行处理。对话绑定到“群 + 成员”；同一成员跨群也隔离。
+服务器向鉴权的本机图片 worker 分配随机任务 ID、会话 ID 与命名所需的成员 ID。Chrome 扩展保存 `会话 ID → Gemini 对话 URL`，一个专用标签页串行处理。已验证的微信成员跨群绑定同一个对话，以“微信成员 ID + 的对话”命名；不同人隔离。
 
 提交前校验完整输入和可用发送按钮，点击后确认新用户消息。取结果时按本轮提示词与轮次重新定位，允许 Gemini 重建 DOM，排除旧图和其他轮次。有效图片优先，模型只返回文字时转回文字。图片原始字节回传 Bridge，再由手机图片服务发送，不截屏。
 
-`/newimg` 切换随机会话 ID，取消该成员旧排队任务与生成任务。暂停、撤销授权、成员停用或 revision 改变也会阻止尚未发送的结果。
+`member_image_sessions` 以稳定成员身份跨群绑定随机会话 ID、对话标题和待删除会话。`/newimg` 切换会话 ID，取消该成员跨群旧任务，通过同一持久队列删除旧 Gemini 对话并创建同名新对话。只有浏览器完成回执才发送成功消息；删除失败保留待清理列表。浏览器按精确会话 URL 操作，拒绝删除还被其他会话绑定的 URL。暂停、撤销授权、成员停用或 revision 改变也会阻止尚未发送的结果。
 
 ## 管理端
 

@@ -19,7 +19,7 @@ test('local extension reload is authenticated, idle-only, version-gated and cons
   // A new queued request must not deadlock a reload already requested at idle.
   const queuedAbort=new AbortController(),queued=images.generate('queued',queuedAbort.signal),queuedCancelled=assert.rejects(queued,/image_cancelled/);
   assert.equal(images.claim(true),null);
-  const beat={method:'POST' as const,url:'/heartbeat',headers,payload:{ready:true,protocol:3,version:'1.2.3'}};
+  const beat={method:'POST' as const,url:'/heartbeat',headers,payload:{ready:true,protocol:4,version:'1.2.3'}};
   assert.equal((await app.inject(beat)).json().reload_extension,true);assert.equal((await app.inject(beat)).json().reload_extension,undefined);
   assert(images.claim(true));queuedAbort.abort();await queuedCancelled;
  }finally{await app.close();}
@@ -52,7 +52,7 @@ test('web image worker preserves long prompts including newlines, emoji and the 
  const prompt='第一段：\n'+('细节要求🌙\n'.repeat(1000))+'结尾要求不得丢失';
  try{
   images.heartbeat(true);const pending=images.generate(prompt,new AbortController().signal);
-  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:3}})).json().task;
+  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:4}})).json().task;
   assert.equal(task.prompt,prompt);assert(task.prompt.length>5000);
   await app.inject({method:'POST',url:'/result',headers,payload:{id:task.id,ok:true,mime_type:'image/png',data:png.toString('base64')}});
   assert.deepEqual(Buffer.from((await pending).data),png);
@@ -61,14 +61,14 @@ test('web image worker preserves long prompts including newlines, emoji and the 
 test('web worker authenticates a narrow extension channel, claims once, validates image and rejects duplicate delivery',async()=>{
  const images=new GeminiWebImages(),app=createGeminiWorker(config,images);
  try{
-  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{host:headers.host},payload:{ready:true,protocol:3}})).statusCode,401);
-  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{...headers,origin:'https://gemini.google.com'},payload:{ready:true,protocol:3}})).statusCode,403);
-  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{...headers,host:'evil.example'},payload:{ready:true,protocol:3}})).statusCode,403);
-  await app.inject({method:'POST',url:'/heartbeat',headers,payload:{ready:true,protocol:3}});
+  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{host:headers.host},payload:{ready:true,protocol:4}})).statusCode,401);
+  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{...headers,origin:'https://gemini.google.com'},payload:{ready:true,protocol:4}})).statusCode,403);
+  assert.equal((await app.inject({method:'POST',url:'/claim',headers:{...headers,host:'evil.example'},payload:{ready:true,protocol:4}})).statusCode,403);
+  await app.inject({method:'POST',url:'/heartbeat',headers,payload:{ready:true,protocol:4}});
   const pending=images.generate('白猫',new AbortController().signal);
-  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:3}})).json().task;
+  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:4}})).json().task;
   assert.equal(task.prompt,'白猫');
-  assert.equal((await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:3}})).json().task,null);
+  assert.equal((await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:4}})).json().task,null);
   const invalid=await app.inject({method:'POST',url:'/result',headers,payload:{id:task.id,ok:true,mime_type:'image/png',data:Buffer.from('invalid image body text').toString('base64')}});
   assert.equal(invalid.statusCode,503);assert.equal(images.status().pending,1);
   const result={id:task.id,ok:true,mime_type:'image/png',data:png.toString('base64')};
@@ -137,13 +137,38 @@ test('the session protocol gates older extensions and propagates opaque sessions
   const outcome=assert.rejects(pending,/image_cancelled/);
   const old=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true}})).json();
   assert.equal(old.task,null);assert.equal(old.upgrade_required,true);
-  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:3,version:'1.2.0'}})).json().task;
+  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:4,version:'1.2.0'}})).json().task;
   assert.equal(task.session_id,session);assert.equal(task.chat_id,undefined);assert.equal(task.member_id,undefined);
-  const beat={ready:true,protocol:3,version:'1.2.0',task_id:task.id};
+  const beat={ready:true,protocol:4,version:'1.2.0',task_id:task.id};
   assert.equal((await app.inject({method:'POST',url:'/heartbeat',headers,payload:beat})).json().task_active,true);
   signal.abort();await outcome;
   assert.equal((await app.inject({method:'POST',url:'/heartbeat',headers,payload:beat})).json().task_active,false);
   assert.equal(images.status().extension_version,'1.2.0');
+ }finally{await app.close();}
+});
+
+test('a reset carries only its exact title and retired sessions and needs a reset-specific completion',async()=>{
+ const images=new GeminiWebImages(),app=createGeminiWorker(config,images);images.heartbeat(true);
+ try{
+  const session='ea216de1-e0dc-4b2c-8dfc-bbe5b7361ea0',old='ea216de1-e0dc-4b2c-8dfc-bbe5b7361ea1';
+  const pending=images.resetSession(session,{title:'wxid_alice的对话',retired_sessions:[old]},new AbortController().signal);
+  assert.equal((await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:3,version:'1.2.4'}})).json().task,null);
+  const task=(await app.inject({method:'POST',url:'/claim',headers,payload:{ready:true,protocol:4,version:'1.3.0'}})).json().task;
+  assert.equal(task.operation,'reset');assert.equal(task.conversation_title,'wxid_alice的对话');assert.deepEqual(task.retired_sessions,[old]);
+  assert.equal(images.complete(task.id,{mime_type:'image/png',data:png}),false);
+  assert.equal((await app.inject({method:'POST',url:'/result',headers,payload:{id:task.id,ok:true,reset_complete:true}})).statusCode,200);
+  await pending;assert.equal(images.status().pending,0);
+ }finally{await app.close();}
+});
+
+test('session diagnostics cannot target a real or unknown member session',async()=>{
+ const images=new GeminiWebImages(),app=createGeminiWorker(config,images);images.heartbeat(true);
+ try{
+  for(const action of ['reset','cleanup']){
+   assert.equal((await app.inject({method:'POST',url:'/probe-session',headers,payload:{action,session_id:'ea216de1-e0dc-4b2c-8dfc-bbe5b7361ea0'}})).statusCode,404);
+   assert.equal(images.status().pending,0);
+  }
+  assert.equal((await app.inject({method:'POST',url:'/probe-session',headers:{host:headers.host},payload:{action:'create'}})).statusCode,401);
  }finally{await app.close();}
 });
 

@@ -3,9 +3,9 @@ import {randomUUID,timingSafeEqual,createHash} from 'node:crypto';
 import {z} from 'zod';
 import type {Config} from './config.js';
 import type {GeneratedImage} from '../../../packages/shared/types.js';
-import {ImageGenerationError,ImageTextResponse,validateImage,type ImageGenerator,maxImageBytes} from './images.js';
+import {ImageGenerationError,ImageTextResponse,validateImage,type ImageGenerator,type ImageSessionContext,maxImageBytes} from './images.js';
 
-type Task={id:string;prompt:string;image_url?:string;session_id:string;expires:number;claimed:boolean;ready:()=>void;finish:(image?:GeneratedImage,error?:Error)=>void};
+type Task={id:string;prompt:string;image_url?:string;session_id:string;operation:'generate'|'reset'|'cleanup';context?:ImageSessionContext;expires:number;claimed:boolean;ready:()=>void;finish:(image?:GeneratedImage,error?:Error)=>void};
 /** A narrow image-only worker channel. Browser credentials never leave Chrome. */
 export class GeminiWebImages implements ImageGenerator {
   private tasks=new Map<string,Task>();
@@ -17,8 +17,10 @@ export class GeminiWebImages implements ImageGenerator {
   private workerFailure:{error:string;http_status:number;at:number}|null=null;
   private navigationFailure:{stage:string;message:string;at:number}|null=null;
   private reloadRequested=false;
+  private failureStep:string|null=null;
   constructor(private timeoutMs=240_000,private connectTimeoutMs=45_000){}
-  status(){return {provider:'gemini_web',connected:this.ready&&Date.now()-this.seen<90_000,last_seen:this.seen||null,pending:this.tasks.size,last_error:this.lastError,extension_version:this.extensionVersion,phase:this.phase,worker_failure:this.workerFailure,navigation_failure:this.navigationFailure};}
+  status(){return {provider:'gemini_web',connected:this.ready&&Date.now()-this.seen<90_000,last_seen:this.seen||null,pending:this.tasks.size,last_error:this.lastError,extension_version:this.extensionVersion,phase:this.phase,worker_failure:this.workerFailure,navigation_failure:this.navigationFailure,failure_step:this.failureStep};}
+  failureStepAt(step:string){this.failureStep=step;}
   extension(version?:string,phase?:string){this.extensionVersion=version??null;this.phase=phase??null;}
   failure(error:string,httpStatus=0){this.workerFailure={error,http_status:httpStatus,at:Date.now()};}
   navigationFailureAt(stage:string,message:string){this.navigationFailure={stage,message,at:Date.now()};}
@@ -36,14 +38,25 @@ export class GeminiWebImages implements ImageGenerator {
     if(!ready||[...this.tasks.values()].some(t=>t.claimed))return null;
     const task=this.tasks.values().next().value as Task|undefined;
     if(!task)return null;
-    task.claimed=true;return {id:task.id,prompt:task.prompt,session_id:task.session_id,expires:task.expires,...(task.image_url?{image_url:task.image_url}:{})};
+    task.claimed=true;return {id:task.id,prompt:task.prompt,session_id:task.session_id,operation:task.operation,expires:task.expires,...(task.context?{conversation_title:task.context.title,retired_sessions:task.context.retired_sessions}:{}),...(task.image_url?{image_url:task.image_url}:{})};
   }
-  complete(id:string,image?:GeneratedImage,error?:Error){
+  complete(id:string,image?:GeneratedImage,error?:Error,reset=false){
     const task=this.tasks.get(id);if(!task?.claimed)return false;
+    if(!error&&reset!==(task.operation!=='generate'))return false;
     if(image)validateImage(image.data,image.mime_type);
     task.finish(image,error);return true;
   }
-  generate(prompt:string,signal:AbortSignal,sessionId=randomUUID(),imageUrl?:string):Promise<GeneratedImage>{
+  async generate(prompt:string,signal:AbortSignal,sessionId:string=randomUUID(),context?:ImageSessionContext,imageUrl?:string):Promise<GeneratedImage>{
+    const image=await this.request(prompt,signal,sessionId,context,imageUrl);
+    if(!image)throw Error('image_not_returned');return image;
+  }
+  async resetSession(sessionId:string,context:ImageSessionContext,signal:AbortSignal){
+    await this.request('请只回复“已准备好”。这是一个新的图片创作对话，暂时不要生成图片。',signal,sessionId,context,undefined,'reset');
+  }
+  async cleanupProbeSession(sessionId:string,title:string,signal:AbortSignal){
+    await this.request('Cleanup diagnostic',signal,randomUUID(),{title,retired_sessions:[sessionId]},undefined,'cleanup');
+  }
+  private request(prompt:string,signal:AbortSignal,sessionId:string,context?:ImageSessionContext,imageUrl?:string,operation:'generate'|'reset'|'cleanup'='generate'):Promise<GeneratedImage|undefined>{
     if(!prompt.trim())return Promise.reject(new Error('invalid_image_prompt'));
     if(signal.aborted)return Promise.reject(new Error('image_cancelled'));
     if(this.tasks.size>=10)return Promise.reject(new ImageGenerationError('image_rate_limited',429));
@@ -53,14 +66,14 @@ export class GeminiWebImages implements ImageGenerator {
         if(!this.tasks.delete(id))return;
         clearTimeout(timer);clearTimeout(connectionTimer);signal.removeEventListener('abort',cancel);
         this.lastError=error?.message??null;
-        if(error)reject(error);else if(image)resolve(image);else reject(new Error('image_not_returned'));
+        if(error)reject(error);else if(image||operation!=='generate')resolve(image);else reject(new Error('image_not_returned'));
       };
       const cancel=()=>finish(undefined,new Error('image_cancelled'));
       const timer=setTimeout(()=>finish(undefined,new ImageGenerationError('image_browser_timeout',504)),this.timeoutMs);
       // An extension restart/navigation briefly reports ready:false. Keep the request
       // until its first ready heartbeat instead of rejecting a recoverable transition.
       const connectionTimer=this.status().connected?undefined:setTimeout(()=>finish(undefined,new ImageGenerationError('image_browser_offline',503)),this.connectTimeoutMs);
-      this.tasks.set(id,{id,prompt,...(imageUrl?{image_url:imageUrl}:{}),session_id:sessionId,expires,claimed:false,ready:()=>clearTimeout(connectionTimer),finish});
+      this.tasks.set(id,{id,prompt,...(imageUrl?{image_url:imageUrl}:{}),session_id:sessionId,operation,context,expires,claimed:false,ready:()=>clearTimeout(connectionTimer),finish});
       signal.addEventListener('abort',cancel,{once:true});
     });
   }
@@ -86,12 +99,39 @@ export function createGeminiWorker(config:Config,images:GeminiWebImages){
     const {stage,message}=z.object({stage:z.enum(['update','reload']),message:z.string().max(240)}).strict().parse(req.body);
     images.navigationFailureAt(stage,message);return {ok:true};
   });
-  app.post('/probe-generation',async req=>{
-    const {prompt}=z.object({prompt:z.string().trim().min(1).max(1000)}).strict().parse(req.body);
+  app.post('/failure-step',async req=>{
+    const {step}=z.object({step:z.enum(['start','delete','submit','bind','response','download','rename'])}).strict().parse(req.body);
+    images.failureStepAt(step);return {ok:true};
+  });
+  // A diagnostic can operate only on synthetic sessions created here during this
+  // server run. It cannot name, delete or generate in a real member's conversation.
+  const probeSessions=new Map<string,string>();
+  app.get('/probe-sessions',async()=>({sessions:[...probeSessions].map(([session_id,title])=>({session_id,title}))}));
+  app.post('/probe-session',async(req,res)=>{
+    const input=z.object({action:z.enum(['create','reset','cleanup']),session_id:z.string().uuid().optional()}).strict().parse(req.body);
     if(!images.status().connected||images.status().pending)throw Error('worker_busy_or_offline');
+    if(input.action!=='create'&&(!input.session_id||!probeSessions.has(input.session_id)))return res.code(404).send({error:'probe_session_not_found'});
+    if(input.action==='create'&&input.session_id)throw Error('invalid_probe');
+    const session=randomUUID(),title=input.session_id?probeSessions.get(input.session_id)!:'wbot_image_test_'+session+'的对话';
     const abort=new AbortController(),cancel=()=>abort.abort();req.raw.on('aborted',cancel);
     try{
-      const image=await images.generate(prompt,abort.signal);
+      if(input.action==='cleanup')await images.cleanupProbeSession(input.session_id!,title,abort.signal);
+      else{
+        // Retain diagnostics after an uncertain timeout so cleanup remains possible.
+        probeSessions.set(session,title);
+        await images.resetSession(session,{title,retired_sessions:input.session_id?[input.session_id]:[]},abort.signal);
+      }
+      if(input.session_id)probeSessions.delete(input.session_id);
+      return {ok:true,...(input.action==='cleanup'?{}:{session_id:session,title})};
+    }finally{req.raw.off('aborted',cancel);}
+  });
+  app.post('/probe-generation',async req=>{
+    const {prompt,session_id}=z.object({prompt:z.string().trim().min(1).max(1000),session_id:z.string().uuid().optional()}).strict().parse(req.body);
+    if(!images.status().connected||images.status().pending)throw Error('worker_busy_or_offline');
+    if(session_id&&!probeSessions.has(session_id))throw Error('invalid_probe_session');
+    const abort=new AbortController(),cancel=()=>abort.abort();req.raw.on('aborted',cancel);
+    try{
+      const image=await images.generate(prompt,abort.signal,session_id,session_id?{title:probeSessions.get(session_id)!,retired_sessions:[]}:undefined);
       return {ok:true,mime_type:image.mime_type,bytes:image.data.length,sha256:createHash('sha256').update(image.data).digest('hex')};
     }finally{req.raw.off('aborted',cancel);}
   });
@@ -110,27 +150,31 @@ export function createGeminiWorker(config:Config,images:GeminiWebImages){
     if(state.pending)throw Error('worker_busy');
     const abort=new AbortController(),cancel=()=>abort.abort();req.raw.on('aborted',cancel);
     try{
-      const image=await images.generate('Download diagnostic',abort.signal,randomUUID(),url);
+      const image=await images.generate('Download diagnostic',abort.signal,randomUUID(),undefined,url);
       return {ok:true,mime_type:image.mime_type,bytes:image.data.length,sha256:createHash('sha256').update(image.data).digest('hex')};
     }finally{req.raw.off('aborted',cancel);}
   });
   const heartbeat=z.object({ready:z.boolean(),protocol:z.number().int().optional(),phase:z.enum(['loading','dispatching','generating']).optional(),version:z.string().max(32).optional(),task_id:z.string().uuid().optional()}).strict();
   app.post('/heartbeat',async req=>{
-    const value=heartbeat.parse(req.body);images.extension(value.version,value.phase);images.heartbeat(value.ready&&value.protocol===3);
-    return {ok:true,...(value.task_id?{task_active:images.active(value.task_id)}:{}),...(!value.task_id&&images.takeReload()?{reload_extension:true}:{}),upgrade_required:value.protocol!==3};
+    const value=heartbeat.parse(req.body);images.extension(value.version,value.phase);images.heartbeat(value.ready&&value.protocol===4);
+    return {ok:true,...(value.task_id?{task_active:images.active(value.task_id)}:{}),...(!value.task_id&&images.takeReload()?{reload_extension:true}:{}),upgrade_required:value.protocol!==4};
   });
   app.post('/claim',async req=>{
     const value=heartbeat.parse(req.body);images.extension(value.version,value.phase);
-    if(value.protocol!==3){images.heartbeat(false);return {task:null,upgrade_required:true};}
+    if(value.protocol!==4){images.heartbeat(false);return {task:null,upgrade_required:true};}
     return {task:images.claim(value.ready)};
   });
   app.post('/result',async(req,res)=>{
     const value=z.union([
       z.object({id:z.string().uuid(),ok:z.literal(true),mime_type:z.enum(['image/png','image/jpeg','image/webp']),data:z.string().max(Math.ceil(maxImageBytes/3)*4).regex(/^[A-Za-z0-9+/]+={0,2}$/)}).strict(),
+      z.object({id:z.string().uuid(),ok:z.literal(true),reset_complete:z.literal(true)}).strict(),
       z.object({id:z.string().uuid(),ok:z.literal(false),error:z.literal('text_response'),text:z.string().trim().min(1).max(2000)}).strict(),
       z.object({id:z.string().uuid(),ok:z.literal(false),error:z.literal('download_failed'),download_status:z.number().int().min(0).max(599)}).strict(),
-      z.object({id:z.string().uuid(),ok:z.literal(false),error:z.enum(['login_required','quota','timeout','page_changed','browser_restarted','generation_failed','submission_failed'])}).strict()
+      z.object({id:z.string().uuid(),ok:z.literal(false),error:z.enum(['login_required','quota','timeout','page_changed','browser_restarted','generation_failed','submission_failed','conversation_rename_failed','conversation_delete_failed','conversation_conflict'])}).strict()
     ]).parse(req.body);
+    if(value.ok&&'reset_complete' in value){
+      return images.complete(value.id,undefined,undefined,true)?{ok:true}:res.code(409).send({error:'task_expired'});
+    }
     if(!value.ok&&value.error==='text_response'){
       const accepted=images.complete(value.id,undefined,new ImageTextResponse(value.text));
       return accepted?{ok:true}:res.code(409).send({error:'task_expired'});

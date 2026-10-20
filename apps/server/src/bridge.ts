@@ -33,7 +33,7 @@ export class Bridge extends EventEmitter {
   private busy=false;private timer:NodeJS.Timeout|undefined;private trackers=new Map<string,WindowTracker>();private eventTrackers=new Map<string,WindowTracker>();private cursor=0;
   private replyChain:Promise<void>=Promise.resolve();private pendingReplies=0;private pendingChats=new Set<string>();
   private imageChain:Promise<void>=Promise.resolve();
-  private imageRequests=new Map<string,{member:Member;session:string;controller:AbortController}>();
+  private imageRequests=new Map<string,{member:Member;session:string;controller:AbortController;maintenance:boolean}>();
   private commandChain:Promise<void>=Promise.resolve();private pendingCommands=0;private lastCommand=new Map<string,number>();
   readonly wechatAdmin:WechatAdmin;
   readonly groupMemory:GroupMemory;
@@ -206,6 +206,18 @@ export class Bridge extends EventEmitter {
       const key=message.chat_id+':'+member.id;
       if(this.pendingCommands>=10||(!admin&&Date.now()-(this.lastCommand.get(key)??0)<2000)||!this.store.once(message.message_id))return;
       this.lastCommand.set(key,Date.now());this.pendingCommands++;const signal=this.abort.signal;
+      if(/^\/newimg\s*$/i.test(text)&&this.images.resetSession){
+        this.pendingCommands--;
+        if(this.imageQueue.count()>=10){
+          this.store.enqueue(member.chat_id,'生图队列已满，请稍后重试 /newimg。','error:'+message.message_id);return;
+        }
+        this.memory.newImageSession(member.chat_id,member.id);this.cancelStaleImages();
+        const session=this.memory.imageSession(member.chat_id,member.id);
+        this.imageQueue.add({id:message.message_id,chat_id:member.chat_id,member_id:member.id,revision:member.revision,session_id:session,prompt:'',kind:'reset'});
+        const progress=this.store.enqueue(member.chat_id,'正在删除你的旧生图对话并创建新对话。','progress:'+message.message_id);
+        this.memory.trackImageJob(progress.id,member,session);
+        this.scheduleImage(this.imageQueue.get(message.message_id)!);return;
+      }
       // Reset at receipt time so a following /img in the same phone batch gets the
       // new session, while already queued requests keep their original session.
       const imageReset=/^\/newimg\s*$/i.test(text)?command(text,member,this.memory,this.models,admin):undefined;
@@ -261,12 +273,17 @@ export class Bridge extends EventEmitter {
     };
     this.replyChain=this.replyChain.then(run).finally(()=>{this.pendingReplies--;this.pendingChats.delete(message.chat_id);});
   }
-  private imageCurrent(member:Member,session:string){
+  private imageCurrent(member:Member,session:string,maintenance=false,ignoreSession=false){
     const current=this.memory.member(member.chat_id,member.id);
-    return !this.paused&&this.autoReply&&this.isAllowed(member.chat_id)&&!this.memory.group(member.chat_id)?.paused&&
-      current?.enabled&&current.revision===member.revision&&this.memory.imageSession(member.chat_id,member.id)===session;
+    return !this.paused&&this.autoReply&&this.isAllowed(member.chat_id)&&(maintenance||!this.memory.group(member.chat_id)?.paused)&&
+      current?.enabled&&current.revision===member.revision&&(ignoreSession||this.memory.imageSession(member.chat_id,member.id)===session);
   }
-  private cancelStaleImages(){for(const task of this.imageRequests.values())if(!this.imageCurrent(task.member,task.session))task.controller.abort();}
+  private cancelStaleImages(){
+    // A second /newimg supersedes the first result, but must let an in-flight
+    // deletion finish and save its receipt. The next reset retires that session.
+    for(const task of this.imageRequests.values())
+      if(!this.imageCurrent(task.member,task.session,task.maintenance,task.maintenance))task.controller.abort();
+  }
   private queueImage(message:Message,member:Member,prompt:string){
     this.store.db.exec('BEGIN IMMEDIATE');
     try{
@@ -283,36 +300,46 @@ export class Bridge extends EventEmitter {
   }
   private scheduleImage(request:ImageRequest){
     if(this.imageRequests.has(request.id))return;
-    const member=this.memory.member(request.chat_id,request.member_id),session=request.session_id;
-    if(!member||member.revision!==request.revision||!this.imageCurrent(member,session)){
+    const member=this.memory.member(request.chat_id,request.member_id),session=request.session_id,maintenance=request.kind==='reset';
+    if(!member||member.revision!==request.revision||!this.imageCurrent(member,session,maintenance)){
       this.imageQueue.update(request.id,'cancelled','authorization_or_session_changed');return;
     }
     const controller=new AbortController(),signal=AbortSignal.any([this.abort.signal,controller.signal]);
-    this.imageRequests.set(request.id,{member,session,controller});
+    this.imageRequests.set(request.id,{member,session,controller,maintenance});
     this.imageChain=this.imageChain.then(async()=>{
       // On shutdown, prompts which never reached the browser remain recoverable.
       if(this.closed)return;
-      if(signal.aborted||!this.imageCurrent(member,session)){this.imageQueue.update(request.id,'cancelled','authorization_or_session_changed');return;}
+      if(signal.aborted||!this.imageCurrent(member,session,maintenance)){this.imageQueue.update(request.id,'cancelled','authorization_or_session_changed');return;}
       const saved=this.imageQueue.get(request.id);if(saved?.state!=='queued')return;
       const prompt=saved.prompt;this.imageQueue.update(request.id,'running');
       try{
+        const context=this.memory.imageContext(member.chat_id,member.id);
+        if(saved.kind==='reset'){
+          if(!this.images.resetSession)throw Error('image_reset_unavailable');
+          await this.images.resetSession(session,context,signal);
+          if(signal.aborted||!this.imageCurrent(member,session,true))return;
+          this.memory.imageSessionReady(member.chat_id,member.id,session);
+          const job=await this.enqueue(request.chat_id,'已删除旧生图对话，并新建「'+context.title+'」。所有群同步生效。','reply:'+request.id);
+          this.memory.trackImageJob(job.id,member,session);this.imageQueue.update(request.id,'completed');return;
+        }
         if(!this.driver.sendImage)throw new Error('image_transport_unavailable');
-        const image=await this.images.generate(prompt,signal,session);
-        if(signal.aborted||!this.imageCurrent(member,session))return;
+        const image=await this.images.generate(prompt,signal,session,context);
+        this.memory.imageSessionReady(member.chat_id,member.id,session);
+        if(signal.aborted||!this.imageCurrent(member,session,maintenance))return;
         await this.allowedChat(request.chat_id);
-        if(signal.aborted||!this.imageCurrent(member,session))return;
+        if(signal.aborted||!this.imageCurrent(member,session,maintenance))return;
         this.store.enqueueImage(request.chat_id,prompt,image,'reply:'+request.id,job=>{
           this.memory.stage(job.id,member,'/img '+prompt,'[已生成图片]');this.memory.trackImageJob(job.id,member,session);
           this.imageQueue.update(request.id,'completed');
         });
       }catch(e){
-        if(signal.aborted||!this.imageCurrent(member,session))return;
+        if(signal.aborted||!this.imageCurrent(member,session,maintenance))return;
         const reason=e instanceof ImageGenerationError?e.reason:'image_generation_failed';
         this.store.set('last_image_error',JSON.stringify({at:Date.now(),chat_id:request.chat_id,message_id:request.id,reason,http_status:e instanceof ImageGenerationError?e.httpStatus:undefined,retry_at:e instanceof ImageGenerationError?e.retryAt:undefined}));
         this.emitEvent({event:'reply.failed',message_id:request.id,reason});
         this.store.db.exec('BEGIN IMMEDIATE');
         try{
-          const job=this.store.enqueue(request.chat_id,imageErrorReply(e),'error:'+request.id);
+          const job=this.store.enqueue(request.chat_id,saved.kind==='reset'?'生图对话重建未完成，旧任务已取消。请稍后重试 /newimg。':imageErrorReply(e),'error:'+request.id);
           this.memory.trackImageJob(job.id,member,session);this.imageQueue.update(request.id,'failed',reason);
           this.store.db.exec('COMMIT');
         }catch(error){this.store.db.exec('ROLLBACK');throw error;}

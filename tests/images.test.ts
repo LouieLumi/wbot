@@ -11,7 +11,7 @@ import {Store} from '../apps/server/src/store.js';
 import {Memories} from '../apps/server/src/memory.js';
 import {Models} from '../apps/server/src/models.js';
 import {readConfig} from '../apps/server/src/config.js';
-import {GeminiImages,ImageTextResponse,validateImage} from '../apps/server/src/images.js';
+import {GeminiImages,ImageTextResponse,validateImage,type ImageGenerator} from '../apps/server/src/images.js';
 import {AndroidHookDriver} from '../apps/server/src/android-hook.js';
 import type {Chat,DeviceAdapter,GeneratedImage,Message,SendResult} from '../packages/shared/types.js';
 
@@ -21,11 +21,11 @@ const group:Chat={id:'123@chatroom',name:'图片测试群',type:'group',verified
 const second:Chat={...group,id:'456@chatroom'};
 const config=(extra={})=>readConfig({BRIDGE_API_TOKEN:'b'.repeat(64),WECHAT_DEVICE_MODE:'android_hook',WECHAT_HOOK_TOKEN:'a'.repeat(64),WECHAT_ALLOWED_CHAT_IDS:JSON.stringify([group.id,second.id]),WECHAT_BOT_NAME:'Nila',WECHAT_REPLY_MODE:'text_mention',...extra});
 const message=(content:string,chat=group):Message=>({event:'message.received',message_id:randomUUID(),chat_id:chat.id,chat_name:chat.name,chat_type:'group',sender:'Alice',sender_wxid:'wxid_alice',own:false,mention:'none',timestamp:Date.now(),content});
-function setup(generate:(prompt:string,signal:AbortSignal,sessionId?:string)=>Promise<GeneratedImage>,result:SendResult={state:'sent',reason:'wechat_server_ack'},path=':memory:'){
+function setup(generate:ImageGenerator['generate'],result:SendResult={state:'sent',reason:'wechat_server_ack'},path=':memory:',resetSession?:ImageGenerator['resetSession']){
  const c=config(),store=new Store(path),text:string[]=[],sent:GeneratedImage[]=[],ai:string[]=[];
  const driver:DeviceAdapter={status:async()=>({}),chats:async()=>[group,second],snapshot:async()=>{throw Error('No screenshots');},pollEvents:async()=>({messages:[],reliability:'code_events'}),
   send:async(_chat,content)=>{text.push(content);return {state:'sent',reason:'wechat_server_ack'};},sendImage:async(_chat,picture)=>{sent.push(picture);return result;}};
- const bridge=new Bridge(c,driver,store,{reply:async(m)=>{ai.push(m.content);return '文字回复';}},new Memories(store),new Models(c,store),{generate});
+ const bridge=new Bridge(c,driver,store,{reply:async(m)=>{ai.push(m.content);return '文字回复';}},new Memories(store),new Models(c,store),{generate,resetSession});
  bridge.control(false,true);return {store,bridge,driver,text,sent,ai,async close(){await bridge.close();store.close();}};
 }
 
@@ -170,7 +170,7 @@ test('quota failure is reported to the group and records only diagnostic metadat
  }finally{await s.close();}
 });
 
-test('same-group users queue without drops; sessions isolate users and groups and survive restart',async()=>{
+test('same-group users queue without drops; sessions isolate users, follow verified members across groups and survive restart',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'nila-sessions-')),path=join(dir,'db');
  const calls:{prompt:string;session?:string}[]=[];
  let release!:(picture:GeneratedImage)=>void,started!:()=>void;
@@ -184,7 +184,7 @@ test('same-group users queue without drops; sessions isolate users and groups an
   await new Promise(r=>setImmediate(r));assert.deepEqual(s.ai,['同群文字不被生图阻塞']);
   release(image);await s.bridge.repliesIdle();
   assert.deepEqual(calls.map(c=>c.prompt),['A1','B1','A2','other-group']);
-  assert.equal(calls[0]!.session,calls[2]!.session);assert.notEqual(calls[0]!.session,calls[1]!.session);assert.notEqual(calls[0]!.session,calls[3]!.session);
+  assert.equal(calls[0]!.session,calls[2]!.session);assert.notEqual(calls[0]!.session,calls[1]!.session);assert.equal(calls[0]!.session,calls[3]!.session);
   assert.equal(s.store.db.prepare('SELECT count(*) AS n FROM job_images').get()!.n,4);
   await s.close();s=setup(async(prompt,_signal,session)=>{calls.push({prompt,session});return image;},undefined,path);
   await s.bridge.groups();s.bridge.receive({...message('/img after-restart'),sender:'改过的昵称'});await s.bridge.repliesIdle();
@@ -230,6 +230,92 @@ test('/newimg also invalidates a generated image waiting for delivery without af
   assert.equal(s.store.db.prepare("SELECT state FROM jobs WHERE content='[图片] old'").get()!.state,'failed');
   assert.equal(s.store.db.prepare("SELECT state FROM jobs WHERE content='[图片] Bob'").get()!.state,'sent');
  }finally{await s.close();}
+});
+
+test('a verified member gets their WeChat ID title across groups; reset deletes before the next image and acknowledges only completion',async()=>{
+ const calls:{kind:string;session:string|undefined;title:string|undefined;old:string[]}[]=[];
+ let release!:()=>void,started!:()=>void;
+ const ready=new Promise<void>(r=>started=r);
+ const s=setup(async(_prompt,_signal,session,context)=>{
+  calls.push({kind:'image',session,title:context?.title,old:context?.retired_sessions??[]});return image;
+ },undefined,':memory:',async(session,context)=>{
+  calls.push({kind:'reset',session,title:context.title,old:context.retired_sessions});started();
+  await new Promise<void>(r=>release=r);
+ });
+ try{
+  await s.bridge.groups();s.bridge.receive(message('/img first'));await s.bridge.repliesIdle();
+  const old=calls[0]!.session!;
+  s.bridge.receive({...message('/newimg',second),sender:'新昵称'});await ready;
+  s.bridge.receive(message('/img second'));
+  assert.equal(calls.length,2);assert.equal(calls[1]!.title,'wxid_alice的对话');assert.deepEqual(calls[1]!.old,[old]);
+  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已删除旧生图对话%'").get()!.n,0);
+  release();await s.bridge.repliesIdle();
+  assert.deepEqual(calls.map(c=>c.kind),['image','reset','image']);
+  assert.equal(calls[1]!.session,calls[2]!.session);assert.notEqual(old,calls[2]!.session);assert.deepEqual(calls[2]!.old,[]);
+  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已删除旧生图对话%'").get()!.n,1);
+  assert.equal(s.store.db.prepare("SELECT state FROM jobs WHERE content='[图片] first'").get()!.state,'failed');
+ }finally{release?.();await s.close();}
+});
+
+test('legacy group sessions migrate once and all of that member’s old sessions are retired on reset',async()=>{
+ const s=setup(async()=>image);
+ try{
+  await s.bridge.groups();
+  const a=s.bridge.memory.identifyWechat(group.id,'wxid_alice','Same name');
+  const other=s.bridge.memory.identifyWechat(second.id,'wxid_alice','Other name');
+  const bob=s.bridge.memory.identifyWechat(group.id,'wxid_bob','Same name');
+  const first=randomUUID(),latest=randomUUID(),b=randomUUID();
+  s.store.db.prepare('INSERT INTO image_sessions VALUES(?,?,?)').run(group.id,a.id,first);
+  s.store.db.prepare('INSERT INTO image_sessions VALUES(?,?,?)').run(second.id,other.id,latest);
+  s.store.db.prepare('INSERT INTO image_sessions VALUES(?,?,?)').run(group.id,bob.id,b);
+  assert.equal(s.bridge.memory.imageSession(group.id,a.id),latest);
+  assert.equal(s.bridge.memory.imageSession(second.id,a.id),latest);
+  s.bridge.memory.newImageSession(group.id,a.id);
+  assert.deepEqual(new Set(s.bridge.memory.imageContext(group.id,a.id).retired_sessions),new Set([first,latest]));
+  assert.equal(s.bridge.memory.imageSession(group.id,bob.id),b);
+  s.bridge.memory.newImageSession(second.id,a.id);
+  assert.equal(s.bridge.memory.imageContext(group.id,a.id).retired_sessions.length,3);
+ }finally{await s.close();}
+});
+
+test('failed Gemini deletion never reports a completed reset and keeps cleanup pending for the next request',async()=>{
+ const s=setup(async()=>image,undefined,':memory:',async()=>{throw Error('delete_failed');});
+ try{
+  await s.bridge.groups();s.bridge.receive(message('/img first'));await s.bridge.repliesIdle();
+  s.bridge.receive(message('/newimg'));await s.bridge.repliesIdle();
+  const member=s.bridge.memory.members(group.id)[0]!;
+  assert.equal(s.bridge.memory.imageContext(group.id,member.id).retired_sessions.length,1);
+  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已删除旧生图对话%'").get()!.n,0);
+  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '生图对话重建未完成%'").get()!.n,1);
+ }finally{await s.close();}
+});
+
+test('/newimg remains available while group replies are stopped',async()=>{
+ let resets=0;
+ const s=setup(async()=>{throw Error('No generation expected');},undefined,':memory:',async()=>{resets++;});
+ try{
+  await s.bridge.groups();s.bridge.memory.groupControl(group.id,true);
+  s.bridge.receive(message('/newimg'));await s.bridge.repliesIdle();
+  assert.equal(resets,1);
+  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已删除旧生图对话%'").get()!.n,1);
+ }finally{await s.close();}
+});
+
+test('repeated cross-group resets finish an in-flight deletion before retiring its replacement',async()=>{
+ let release!:()=>void,started!:()=>void;
+ const ready=new Promise<void>(r=>started=r),calls:{session:string;old:string[];signal:AbortSignal}[]=[];
+ const s=setup(async()=>image,undefined,':memory:',async(session,context,signal)=>{
+  calls.push({session,old:context.retired_sessions,signal});
+  if(calls.length===1){started();await new Promise<void>(r=>release=r);}
+ });
+ try{
+  await s.bridge.groups();s.bridge.receive(message('/newimg'));await ready;
+  s.bridge.receive(message('/newimg',second));
+  assert.equal(calls[0]!.signal.aborted,false);
+  release();await s.bridge.repliesIdle();
+  assert.equal(calls.length,2);assert(calls[1]!.old.includes(calls[0]!.session));
+  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已删除旧生图对话%'").get()!.n,1);
+ }finally{release?.();await s.close();}
 });
 
 
