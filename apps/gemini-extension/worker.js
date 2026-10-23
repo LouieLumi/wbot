@@ -1,5 +1,5 @@
 import {endpoint,token} from './connection.js';
-const protocol=4,version='1.3.2';
+const protocol=4,version='1.3.12';
 let operations=Promise.resolve();
 const serial=run=>{const result=operations.then(run);operations=result.catch(()=>{});return result;};
 const api=async(path,body)=>{
@@ -38,30 +38,21 @@ async function failActive(active,error){
   try{await api('/result',{id:active.id,ok:false,error});}catch(e){if(e.status!==409)throw e;}
   await chrome.storage.local.remove('active');
 }
-async function navigationSettled(tabId,url){
-  // tabs.update resolves when navigation starts, before Tab.url necessarily changes.
-  // Reloading then can cancel the pending hash change and reload the old worker URL.
-  const expires=Date.now()+10_000;
-  while(Date.now()<expires){
-    const tab=await chrome.tabs.get(tabId);
-    if(tab.url===url&&tab.status==='complete'&&!tab.pendingUrl)return;
-    await new Promise(resolve=>setTimeout(resolve,100));
-  }
-  throw Error('navigation_not_committed');
-}
 async function loadTask(tabId,active,status){
   const previous=await chrome.tabs.get(tabId);
-  const loading={...active,tabId,phase:'loading',previous_document_id:status?.document_id,
+  const samePath=previous.url?.split('#')[0]===active.page_url.split('#')[0];
+  // The fresh document ID, not the URL fragment, grants ownership. Chrome can
+  // leave a fragment-only tabs.update pending indefinitely. For the same path,
+  // retain its URL and reload directly; this also cannot cancel a pending hash.
+  const pageUrl=samePath?previous.url:active.page_url;
+  const loading={...active,page_url:pageUrl,tabId,phase:'loading',previous_document_id:status?.document_id,
     load_attempts:(active.load_attempts||0)+1,last_navigation:Date.now()};
   await chrome.storage.local.set({active:loading});
   let stage='update';
   try{
-    await chrome.tabs.update(tabId,{url:active.page_url});
-    // A hash change does not reset a draft or create a new page script.
-    if(previous.url?.split('#')[0]===active.page_url.split('#')[0]){
-      await navigationSettled(tabId,active.page_url);
-      stage='reload';await chrome.tabs.reload(tabId);
-    }
+    if(samePath){
+      stage='reload';await chrome.tabs.reload(tabId,{bypassCache:(active.load_attempts||0)>0});
+    }else await chrome.tabs.update(tabId,{url:pageUrl});
   }catch(error){
     const message=String(error?.message||'navigation_failed').replace(/https?:\/\/\S+/g,'[url]').slice(0,240);
     await api('/navigation-failure',{stage,message}).catch(()=>{});throw error;
@@ -87,31 +78,100 @@ async function nextOperation(tabId,task,status){
   await loadTask(tabId,{...task,operation:task.requested_operation||task.operation||'generate',
     deleting_session:undefined,page_url:(saved||'https://gemini.google.com/app')+'#nila-image-worker-'+task.id},status);
 }
+async function recoverUnavailableConversation(tabId,active,status){
+  // A saved URL can be deleted/expire remotely. Recover only a proven empty
+  // landing-page redirect before submission, once per task, retaining the old
+  // binding until the replacement conversation is actually created.
+  const saved=conversation(active.page_url?.split('#')[0]);
+  const declined=async reason=>{await api('/navigation-failure',{stage:'update',message:'conversation_recovery_declined '+reason}).catch(()=>{});return false;};
+  if(!saved||active.operation==='delete'||active.recovery_from||status.empty_landing!==true||Date.now()>=active.expires)return declined('ineligible_or_not_empty');
+  // The page can observe an SPA redirect before tabs.get reflects it.
+  const deadline=Math.min(active.expires,Date.now()+5000);let actual;
+  do{
+    actual=await chrome.tabs.get(tabId);
+    if(actual.status==='complete'&&!actual.pendingUrl&&actual.url?.split('#')[0]==='https://gemini.google.com/app')break;
+    await new Promise(resolve=>setTimeout(resolve,100));
+  }while(Date.now()<deadline);
+  if(actual.status!=='complete'||actual.pendingUrl||actual.url?.split('#')[0]!=='https://gemini.google.com/app')return declined('tab_redirect_not_committed');
+  const {conversations={}}=await chrome.storage.local.get('conversations');
+  if(conversations[active.session_id]!==saved)return declined('binding_changed');
+  await loadTask(tabId,{...active,recovery_from:saved,load_attempts:0,page_url:'https://gemini.google.com/app#nila-image-worker-'+active.id},status);
+  return true;
+}
+async function reloadUnloadedConversation(tabId,active,message){
+  const saved=conversation(active.page_url?.split('#')[0]);
+  if(!saved||active.operation==='delete'||active.history_reloads||message.empty_conversation!==true||
+    message.pageUrl?.split('#')[0]!==saved||active.expires-Date.now()<30_000)return false;
+  const actual=await chrome.tabs.get(tabId);
+  if(actual.status!=='complete'||actual.pendingUrl||actual.url?.split('#')[0]!==saved)return false;
+  const {conversations={}}=await chrome.storage.local.get('conversations');
+  if(conversations[active.session_id]!==saved)return false;
+  // Keep the same owner, URL, prompt and task. loadTask reloads same-path
+  // navigation; this is allowed only before any prompt has been submitted.
+  await loadTask(tabId,{...active,history_reloads:1,load_attempts:0},{document_id:message.document_id});
+  return true;
+}
 async function runTick(){
   const tabId=await ensureTab();
   const status=await chrome.tabs.sendMessage(tabId,{kind:'status'}).catch(()=>null);
   const {active}=await chrome.storage.local.get('active');
-  if(!status||status.protocol!==protocol){
+  if(!status||status.protocol!==protocol||status.page_version!==version){
     // Reload only the dedicated tab when an extension update invalidates its script.
-    await heartbeat(false).catch(()=>{});
-    const tab=await chrome.tabs.get(tabId);if(tab.status!=='complete')return;
+    await heartbeat(false,active).catch(()=>{});
+    const tab=await chrome.tabs.get(tabId);
+    if(active?.phase==='loading'&&Date.now()-(active.last_navigation||0)>=45_000){
+      await api('/navigation-failure',{stage:'reload',message:'page_script_not_ready attempts='+String(active.load_attempts||1)}).catch(()=>{});
+      if((active.load_attempts||0)>=3||active.expires-Date.now()<60_000){
+        await api('/failure-step',{step:'load'}).catch(()=>{});await failActive(active,'page_load_failed');
+      }else await loadTask(tabId,active,status);
+      return;
+    }
+    const {script_wait_since=Date.now()}=await chrome.storage.local.get('script_wait_since');
+    if(tab.status!=='complete'&&Date.now()-script_wait_since<30_000){
+      await chrome.storage.local.set({script_wait_since});return;
+    }
     if(active?.phase==='generating'||active?.phase==='dispatching'){
       await failActive(active,'browser_restarted');
     }
-    const {repairs=[]}=await chrome.storage.local.get('repairs');
-    const recent=repairs.filter(at=>Date.now()-at<10*60_000);
+    const {repairs=[],repair_version}=await chrome.storage.local.get(['repairs','repair_version']);
+    const recent=repair_version===version?repairs.filter(at=>Date.now()-at<10*60_000):[];
     if(recent.length>=3||Date.now()-(recent.at(-1)||0)<60_000)return;
-    await chrome.storage.local.set({repairs:[...recent,Date.now()]});
+    if(status&&status.page_version!==version)await api('/navigation-failure',{stage:'reload',message:'content_script_version_mismatch expected='+version+' actual='+String(status.page_version||'missing').slice(0,32)}).catch(()=>{});
+    await chrome.storage.local.set({repairs:[...recent,Date.now()],repair_version:version});
     await chrome.tabs.reload(tabId);return;
   }
+  await chrome.storage.local.remove('script_wait_since');
   if(active){
     const state=await heartbeat(status.ready===true,active);
     if(state.task_active===false||Date.now()>active.expires){await cancelActive(tabId,active);return;}
     if(active.phase==='loading'){
       const tab=await chrome.tabs.get(tabId);
       const intended=tab.url===active.page_url||tab.url===active.page_url.split('#')[0];
-      if(tab.status==='complete'&&(active.tabId!==tabId||!intended||status.document_id===active.previous_document_id)&&Date.now()-(active.last_navigation||0)>=5000){
-        if((active.load_attempts||0)>=3)await failActive(active,'page_changed');
+      // Navigation can finish while Gemini is still just its static shell. This
+      // task has never been dispatched: retry the same owner/URL with a bounded
+      // load budget, rather than waiting for the full image-generation deadline.
+      if(intended&&status.document_id!==active.previous_document_id&&status.ready!==true&&Date.now()-(active.last_navigation||0)>=45_000){
+        await api('/navigation-failure',{stage:'reload',message:'page_not_ready '+JSON.stringify({ready:false,empty_shell:status.empty_shell===true,attempts:active.load_attempts||1})}).catch(()=>{});
+        if((active.load_attempts||0)>=3||active.expires-Date.now()<60_000||status.busy||status.generating||status.has_draft){
+          await api('/failure-step',{step:'load'}).catch(()=>{});
+          await failActive(active,'page_load_failed');
+        }else await loadTask(tabId,active,status);
+        return;
+      }
+      if((tab.status==='complete'||Date.now()-(active.last_navigation||0)>=45_000)&&(active.tabId!==tabId||!intended||status.document_id===active.previous_document_id)&&Date.now()-(active.last_navigation||0)>=5000){
+        if(active.tabId===tabId&&status.empty_landing===true&&status.document_id!==active.previous_document_id&&await recoverUnavailableConversation(tabId,active,status))return;
+        if((active.load_attempts||0)>=3){
+          // Keep enough evidence to distinguish a redirect, a stale page script
+          // and a tab replacement. Never log prompts, member IDs or chat URLs.
+          const actualBase=tab.url?.split('#')[0],expectedBase=active.page_url.split('#')[0];
+          const destination=actualBase==='https://gemini.google.com/app'?'landing':conversation(actualBase)?'conversation':'other';
+          await api('/navigation-failure',{stage:'update',message:'navigation_not_ready '+JSON.stringify({
+            destination,path_matches:actualBase===expectedBase,hash_matches:tab.url===active.page_url,
+            same_document:status.document_id===active.previous_document_id,tab_changed:active.tabId!==tabId,
+            ready:status.ready===true,attempts:active.load_attempts,
+          })}).catch(()=>{});
+          await failActive(active,'page_changed');
+        }
         else await loadTask(tabId,active,status);
       }
     }else if(active.tabId!==tabId||active.document_id&&status.document_id!==active.document_id){
@@ -121,6 +181,18 @@ async function runTick(){
     return;
   }
   if(status.busy)return;
+  if(status.empty_shell===true){
+    await heartbeat(false);
+    const {shell_since=Date.now(),shell_repairs=[]}=await chrome.storage.local.get(['shell_since','shell_repairs']);
+    const recent=shell_repairs.filter(at=>Date.now()-at<10*60_000);
+    if(Date.now()-shell_since>=30_000&&recent.length<2){
+      await chrome.storage.local.set({shell_since:Date.now(),shell_repairs:[...recent,Date.now()]});
+      await api('/navigation-failure',{stage:'reload',message:'idle_page_shell_reload'}).catch(()=>{});
+      await chrome.tabs.reload(tabId,{bypassCache:true});
+    }else await chrome.storage.local.set({shell_since});
+    return;
+  }
+  await chrome.storage.local.remove('shell_since');
   const {task}=await api('/claim',{ready:status.ready===true,protocol,version});
   if(!task)return;
   if(!/^[a-f0-9-]{36}$/i.test(task.session_id||'')){
@@ -141,8 +213,9 @@ chrome.runtime.onMessage.addListener((message,sender,respond)=>{
     const {tabId,active}=await chrome.storage.local.get(['tabId','active']);
     if(sender.tab?.id!==tabId||!sender.url?.startsWith('https://gemini.google.com/'))return {ignored:true};
     if(message.kind==='ready'){
-      const state=await heartbeat(message.ready===true&&message.protocol===protocol,active);
+      const state=await heartbeat(message.ready===true&&message.protocol===protocol&&message.page_version===version,active);
       if(state.reload_extension)return {updating:true};
+      if(message.page_version!==version){void tick();return {updating:true};}
       if(active){
         if(state.task_active===false||Date.now()>active.expires){await cancelActive(tabId,active);return {expired:true};}
         if(active.tabId===tabId&&(active.phase==='loading'||active.phase==='dispatching'&&message.document_id===active.document_id)&&message.ready===true&&!message.busy&&message.protocol===protocol&&message.document_id&&message.document_id!==active.previous_document_id&&(message.pageUrl===active.page_url||message.pageUrl===active.page_url.split('#')[0])){
@@ -165,14 +238,25 @@ chrome.runtime.onMessage.addListener((message,sender,respond)=>{
       // pushState updates location before Chrome's tab metadata catches up.
       if(actual.url?.split('#')[0]!==url)return !previous&&actual.url?.split('#')[0]==='https://gemini.google.com/app'?{pending:true}:{ignored:true};
       const {conversations={}}=await chrome.storage.local.get('conversations');
-      if(conversations[active.session_id]&&conversations[active.session_id]!==url)return {ignored:true};
+      if(conversations[active.session_id]&&conversations[active.session_id]!==url&&conversations[active.session_id]!==active.recovery_from)return {ignored:true};
       conversations[active.session_id]=url;await chrome.storage.local.set({conversations});return {ok:true};
     }
     if(message.kind==='result'&&active?.id===message.result?.id&&active.document_id===message.document_id){
+      if(message.result.error==='conversation_load_failed'&&message.step==='rename'&&message.submitted===false){
+        const state=await heartbeat(true,active);
+        if(state.task_active===false||Date.now()>active.expires){await cancelActive(tabId,active);return {expired:true};}
+        if(await reloadUnloadedConversation(tabId,active,message))return {ok:true,recovered:true};
+      }
+      if(message.result.error==='conversation_unavailable'&&message.step==='rename'&&message.submitted===false&&message.pageUrl?.split('#')[0]==='https://gemini.google.com/app'){
+        const state=await heartbeat(true,active);
+        if(state.task_active===false||Date.now()>active.expires){await cancelActive(tabId,active);return {expired:true};}
+        if(await recoverUnavailableConversation(tabId,active,message))return {ok:true,recovered:true};
+      }
       if(active.operation==='delete'&&message.result.ok&&message.result.deleted===true){
         const {conversations={}}=await chrome.storage.local.get('conversations');
         const deleted=conversation(active.page_url.split('#')[0]),actual=await chrome.tabs.get(tabId);
-        if(!deleted||actual.url?.split('#')[0]===deleted)return {error:'deletion_not_confirmed'};
+        const clearedInPlace=message.result.cleared===true&&message.pageUrl?.split('#')[0]===deleted&&actual.url?.split('#')[0]===deleted;
+        if(!deleted||actual.url?.split('#')[0]===deleted&&!clearedInPlace)return {error:'deletion_not_confirmed'};
         for(const id of active.retired_sessions||[])if(conversations[id]===deleted)delete conversations[id];
         await chrome.storage.local.set({conversations});
         await nextOperation(tabId,active,{document_id:message.document_id});return {ok:true};
@@ -182,8 +266,8 @@ chrome.runtime.onMessage.addListener((message,sender,respond)=>{
       const actual=await chrome.tabs.get(tabId);
       const {conversations:bindings={}}=await chrome.storage.local.get('conversations');
       const bound=conversation(bindings[active.session_id]);
-      const wrong=url&&(previous&&url!==previous||bound&&url!==bound||actual.url?.split('#')[0]!==url);
-      const result=wrong?{id:active.id,ok:false,error:'page_changed'}:message.result;
+      const wrong=url&&(previous&&url!==previous||bound&&url!==bound&&bound!==active.recovery_from||actual.url?.split('#')[0]!==url);
+      const result=wrong||['conversation_unavailable','conversation_load_failed'].includes(message.result.error)?{id:active.id,ok:false,error:'page_changed'}:message.result;
       const steps=['start','delete','submit','bind','response','download','rename'];
       if(!result.ok&&steps.includes(message.step))await api('/failure-step',{step:message.step}).catch(()=>{});
       // Save the user's conversation before releasing the task. A transient bridge

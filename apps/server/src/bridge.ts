@@ -12,6 +12,8 @@ import {GeminiImages,ImageGenerationError,imageErrorReply,type ImageGenerator} f
 import {WechatAdmin} from './wechat-admin.js';
 import {ImageQueue,type ImageRequest} from './image-queue.js';
 import {GroupMemory} from './group-memory.js';
+import {ReplyQueue,type ReplyRequest} from './reply-queue.js';
+import {memberMemoryKey} from './hermes-memory.js';
 
 export class WindowTracker {
   private previous:Snapshot|null=null;
@@ -31,22 +33,24 @@ export class WindowTracker {
 }
 export class Bridge extends EventEmitter {
   private busy=false;private timer:NodeJS.Timeout|undefined;private trackers=new Map<string,WindowTracker>();private eventTrackers=new Map<string,WindowTracker>();private cursor=0;
-  private replyChain:Promise<void>=Promise.resolve();private pendingReplies=0;private pendingChats=new Set<string>();
+  private replyRequests=new Map<string,Promise<void>>();private replyOwners=new Set<string>();private historyCursor=0;
   private imageChain:Promise<void>=Promise.resolve();
   private imageRequests=new Map<string,{member:Member;session:string;controller:AbortController;maintenance:boolean}>();
-  private commandChain:Promise<void>=Promise.resolve();private pendingCommands=0;private lastCommand=new Map<string,number>();
+  private commandChain:Promise<void>=Promise.resolve();private pendingCommands=0;
   readonly wechatAdmin:WechatAdmin;
   readonly groupMemory:GroupMemory;
   readonly imageQueue:ImageQueue;private imageQueueRecovered=false;
-  private lastReply=new Map<string,number>();private abort=new AbortController();private closed=false;
+  readonly replyQueue:ReplyQueue;
+  private abort=new AbortController();private closed=false;
   paused:boolean;autoReply:boolean;lastReliability='not_started';lastError:string|null=null;activeChat:string|null=null;
   constructor(readonly config:Config,readonly driver:DeviceAdapter,readonly store:Store,private responder:Responder,
     readonly memory=new Memories(store),readonly models=new Models(config,store),private images:ImageGenerator=new GeminiImages(config)){
-    super();this.groupMemory=new GroupMemory(store);this.imageQueue=new ImageQueue(store);this.wechatAdmin=new WechatAdmin(config,store);this.paused=store.get('paused')!=='false';this.autoReply=store.get('auto_reply')?store.get('auto_reply')==='true':config.WECHAT_AUTO_REPLY;
+    super();this.groupMemory=new GroupMemory(store);this.imageQueue=new ImageQueue(store);this.replyQueue=new ReplyQueue(store);this.wechatAdmin=new WechatAdmin(config,store);this.paused=store.get('paused')!=='false';this.autoReply=store.get('auto_reply')?store.get('auto_reply')==='true':config.WECHAT_AUTO_REPLY;
   }
   emitEvent(event:Record<string,unknown>){this.emit('event',event);}
   get deviceBusy(){return this.busy;}
   imageStatus(){return {...(this.images.status?.()??{provider:'proxy',model:this.config.IMAGE_MODEL}) as object,queue:this.imageQueue.status()};}
+  replyStatus(){return {active:this.replyRequests.size,pending:this.replyQueue.count(),queue:this.replyQueue.status()};}
   async deviceIdle(){while(this.busy)await new Promise(r=>setTimeout(r,25));}
   control(paused:boolean,autoReply?:boolean){
     if(paused||autoReply===false){this.abort.abort();this.abort=new AbortController();}
@@ -66,6 +70,16 @@ export class Bridge extends EventEmitter {
     if(!this.imageQueueRecovered&&!this.paused&&this.autoReply){
       this.imageQueueRecovered=true;
       for(const request of this.imageQueue.waiting())this.scheduleImage(request);
+    }
+    if(!this.paused&&this.autoReply){
+      for(const request of this.replyQueue.interrupted()){
+        const member=this.memory.member(request.chat_id,request.member_id);
+        this.store.db.exec('BEGIN IMMEDIATE');try{
+          if(member&&this.replyCurrent(request))this.store.enqueue(request.chat_id,member.name+'，上一条回复因服务重启中断，请重新发送。','error:'+request.id);
+          this.replyQueue.update(request.id,'failed','interrupted_during_generation_notified');this.store.db.exec('COMMIT');
+        }catch(error){this.store.db.exec('ROLLBACK');throw error;}
+      }
+      this.scheduleReplies();
     }
     return groups;
   }
@@ -133,18 +147,6 @@ export class Bridge extends EventEmitter {
         for(const request of requests){const job=this.memory.requestSignup(request);if(job)this.emitEvent({event:'group.signup',chat_id:request.chat_id,job_id:job.id});}
       }
       if(this.driver.pollEvents){
-        // Archive ordinary text through a separate read-only cursor. Historical
-        // records never enter receive(), so reconnects cannot replay old triggers.
-        if(this.driver.groupHistory)for(const group of groups){
-          for(let page=0;page<3&&!this.paused;page++){
-            const state=this.groupMemory.state(group.id);if(!state?.enabled)break;
-            try{
-              const result=await this.driver.groupHistory(group.id,state.since,state.cursor,state.source);
-              if(this.paused||!this.isAllowed(group.id))break;
-              this.groupMemory.accept(group.id,result);if(!result.has_more)break;
-            }catch{this.groupMemory.failed(group.id);break;}
-          }
-        }
         const result=await this.driver.pollEvents();if(this.paused)return;
         this.lastReliability=result.reliability;this.lastError=null;
         for(const group of groups)this.memory.observed(group.id);
@@ -154,6 +156,15 @@ export class Bridge extends EventEmitter {
           const message={...event,chat_name:group.name,member_id:member.id};
           this.activeChat=group.id;this.memory.observed(group.id,'',true);
           this.emitEvent({...message,mentioned_me:false});this.receive(message);
+        }
+        // Receive live requests first. Archive one group page per tick so slow
+        // history reads in many groups cannot starve the phone's event buffer.
+        if(this.driver.groupHistory&&groups.length){
+          const group=groups[this.historyCursor++%groups.length]!,state=this.groupMemory.state(group.id);
+          if(state?.enabled)try{
+            const history=await this.driver.groupHistory(group.id,state.since,state.cursor,state.source);
+            if(!this.paused&&this.isAllowed(group.id))this.groupMemory.accept(group.id,history);
+          }catch{this.groupMemory.failed(group.id);}
         }
         return;
       }
@@ -187,7 +198,7 @@ export class Bridge extends EventEmitter {
         this.emitEvent({...message,mentioned_me:message.mention==='verified'});if(newTriggers.has(row))this.receive(message);
       }
     }catch{this.lastError='device_unavailable_or_unverified';this.lastReliability='unavailable';if(target){this.memory.observed(target.id,this.lastError);}}
-    finally{this.busy=false;}
+    finally{this.busy=false;this.scheduleReplies();}
   }
   receive(message:Message){
     if(this.paused||!this.autoReply||message.own!==false||!this.isAllowed(message.chat_id)||message.chat_type!=='group')return;
@@ -203,9 +214,9 @@ export class Bridge extends EventEmitter {
     const admin=this.wechatAdmin.allows({...message,member_id:member.id});
     // Commands stay available while this group is stopped and do not wait for generation.
     if(isCommand&&!imageCommand?.[1]?.trim()){
-      const key=message.chat_id+':'+member.id;
-      if(this.pendingCommands>=10||(!admin&&Date.now()-(this.lastCommand.get(key)??0)<2000)||!this.store.once(message.message_id))return;
-      this.lastCommand.set(key,Date.now());this.pendingCommands++;const signal=this.abort.signal;
+      if(!this.store.once(message.message_id))return;
+      if(this.pendingCommands>=100){this.store.enqueue(message.chat_id,member.name+'，命令队列已满，请稍后重试。','error:'+message.message_id);return;}
+      this.pendingCommands++;const signal=this.abort.signal;
       if(/^\/newimg\s*$/i.test(text)&&this.images.resetSession){
         this.pendingCommands--;
         if(this.imageQueue.count()>=10){
@@ -242,36 +253,72 @@ export class Bridge extends EventEmitter {
     }
     if(!member.enabled||this.memory.group(message.chat_id)?.paused)return;
     if(imageCommand?.[1]?.trim()){this.queueImage(message,member,imageCommand[1].trim());return;}
-    if(!this.store.once(message.message_id)||this.pendingReplies>=10||this.pendingChats.has(message.chat_id)||(Date.now()-(this.lastReply.get(message.chat_id)??0)<(isCommand?2000:10_000)))return;
-    this.pendingReplies++;this.pendingChats.add(message.chat_id);const signal=this.abort.signal;
-    const run=async()=>{
-      if(signal.aborted||this.paused||!this.autoReply||!this.isAllowed(message.chat_id)||this.memory.group(message.chat_id)?.paused)return;
-      try{
-        // Wait for this member's earlier reply in any group to commit its Hermes
-        // memory. Different people never share a profile or pending context.
-        const deadline=Date.now()+120_000;
-        while(this.memory.pendingMember(message.chat_id,member.id)){
-          if(signal.aborted||this.paused||Date.now()>deadline)return;
-          await new Promise(resolve=>setTimeout(resolve,100));
-        }
-        const current=this.memory.member(message.chat_id,member.id);if(!current||current.revision!==member.revision)return;
-        const generated=await this.responder.reply({...message,content:text,member_id:member.id},signal);
-        let answer=typeof generated==='string'?generated:generated.content;
-        if(signal.aborted||this.paused||!this.autoReply||!this.isAllowed(message.chat_id))return;
-        if(!isCommand&&this.memory.member(message.chat_id,member.id)?.revision!==member.revision)return;
-        const limit=this.config.WECHAT_DEVICE_MODE==='android_hook'?2000:100;
-        if(answer.length>limit)answer=answer.slice(0,limit-9)+'…（已截短）';
-        const job=await this.enqueue(message.chat_id,answer,'reply:'+message.message_id);
-        if(!isCommand)this.memory.stage(job.id,member,text,answer,typeof generated==='string'?undefined:generated.memory,typeof generated!=='string'&&generated.memory_scope==='group'?'group':'member');
-        this.lastReply.set(message.chat_id,Date.now());
-      }catch(e){
-        const reason=e instanceof ImageGenerationError?e.reason:e instanceof Error&&e.message==='model_not_installed'?'model_not_installed':'agent_unavailable_or_not_configured';
-        if(imageCommand)this.store.set('last_image_error',JSON.stringify({at:Date.now(),chat_id:message.chat_id,message_id:message.message_id,reason,http_status:e instanceof ImageGenerationError?e.httpStatus:undefined,retry_at:e instanceof ImageGenerationError?e.retryAt:undefined}));
-        this.emitEvent({event:'reply.failed',message_id:message.message_id,reason});
-        if(isCommand&&!signal.aborted&&!this.paused&&this.isAllowed(message.chat_id)&&!this.memory.group(message.chat_id)?.paused&&this.memory.member(message.chat_id,member.id)?.revision===member.revision)await this.enqueue(message.chat_id,imageCommand?imageErrorReply(e):'命令暂未完成，请稍后重试。','error:'+message.message_id).catch(()=>{});
+    this.store.db.exec('BEGIN IMMEDIATE');try{
+      if(!this.store.once(message.message_id)){this.store.db.exec('COMMIT');return;}
+      const ahead=this.replyQueue.count();
+      if(ahead>=100){
+        this.store.enqueue(message.chat_id,member.name+'，回复队列已满，请稍后重试。','error:'+message.message_id);
+      }else{
+        this.replyQueue.add({...message,content:text,member_id:member.id},member.id,member.revision);
+        if(ahead)this.store.enqueue(message.chat_id,member.name+'，消息已排队，前面还有 '+ahead+' 条。','progress:'+message.message_id);
       }
-    };
-    this.replyChain=this.replyChain.then(run).finally(()=>{this.pendingReplies--;this.pendingChats.delete(message.chat_id);});
+      this.store.db.exec('COMMIT');
+    }catch(error){this.store.db.exec('ROLLBACK');throw error;}
+    this.scheduleReplies();
+  }
+  private replyCurrent(request:ReplyRequest){
+    const member=this.memory.member(request.chat_id,request.member_id);
+    return !this.paused&&this.autoReply&&this.isAllowed(request.chat_id)&&!this.memory.group(request.chat_id)?.paused&&
+      !!member?.enabled&&member.revision===request.revision;
+  }
+  private scheduleReplies(){
+    if(this.closed||this.paused||!this.autoReply)return;
+    for(const request of this.replyQueue.waiting()){
+      if(!this.replyCurrent(request)){this.replyQueue.update(request.id,'cancelled','authorization_or_memory_changed');continue;}
+      const owner=memberMemoryKey(request.chat_id,request.member_id);
+      // One member's next turn waits for the previous WeChat ACK and memory
+      // commit, including across groups. Other members can use the free slot.
+      if(this.replyRequests.size>=2)break;
+      if(this.replyOwners.has(owner)||this.memory.pendingMember(request.chat_id,request.member_id))continue;
+      this.replyOwners.add(owner);this.replyQueue.update(request.id,'running');
+      const signal=this.abort.signal;
+      const pending=Promise.resolve().then(()=>this.runReply(request,signal)).finally(()=>{
+        this.replyRequests.delete(request.id);this.replyOwners.delete(owner);this.scheduleReplies();
+      });
+      this.replyRequests.set(request.id,pending);
+    }
+  }
+  private async runReply(request:ReplyRequest,signal:AbortSignal){
+    try{
+      if(this.closed||signal.aborted||!this.replyCurrent(request))return;
+      const generated=await this.responder.reply(request.message,signal);
+      let answer=(typeof generated==='string'?generated:generated.content).trim();
+      if(!answer)throw Error('empty_reply');
+      if(this.closed||signal.aborted||!this.replyCurrent(request))return;
+      const member=this.memory.member(request.chat_id,request.member_id)!;
+      const limit=this.config.WECHAT_DEVICE_MODE==='android_hook'?2000:100;
+      if(answer.length>limit)answer=answer.slice(0,limit-9)+'…（已截短）';
+      await this.allowedChat(request.chat_id);
+      if(this.closed||signal.aborted||!this.replyCurrent(request))return;
+      this.store.db.exec('BEGIN IMMEDIATE');try{
+        const job=this.store.enqueue(request.chat_id,answer,'reply:'+request.id);
+        this.memory.stage(job.id,member,request.message.content,answer,typeof generated==='string'?undefined:generated.memory,typeof generated!=='string'&&generated.memory_scope==='group'?'group':'member');
+        this.replyQueue.update(request.id,'generated');this.store.db.exec('COMMIT');
+      }catch(error){this.store.db.exec('ROLLBACK');throw error;}
+    }catch(error){
+      if(this.closed||signal.aborted||!this.replyCurrent(request))return;
+      const message=error instanceof Error?error.message:'';
+      const reason=/timeout/i.test(message)?'reply_timeout':message==='model_not_installed'?'model_not_installed':'agent_unavailable_or_not_configured';
+      const member=this.memory.member(request.chat_id,request.member_id)!;
+      this.store.db.exec('BEGIN IMMEDIATE');try{
+        this.store.enqueue(request.chat_id,member.name+(reason==='reply_timeout'?'，这次回复超时了，请稍后重试。':'，这次没能生成回复，请稍后重试。'),'error:'+request.id);
+        this.replyQueue.update(request.id,'failed',reason);this.store.db.exec('COMMIT');
+      }catch(failure){this.store.db.exec('ROLLBACK');throw failure;}
+      this.emitEvent({event:'reply.failed',message_id:request.id,reason});
+    }finally{
+      this.store.db.prepare("UPDATE reply_requests SET state=?,reason=?,updated_at=? WHERE id=? AND state='running'")
+        .run(this.closed?'uncertain':'cancelled',this.closed?'interrupted_during_generation':'authorization_or_memory_changed',Date.now(),request.id);
+    }
   }
   private imageCurrent(member:Member,session:string,maintenance=false,ignoreSession=false){
     const current=this.memory.member(member.chat_id,member.id);
@@ -348,6 +395,9 @@ export class Bridge extends EventEmitter {
       }
     }).catch(()=>{this.imageQueue.update(request.id,'uncertain','queue_processing_failed');}).finally(()=>{this.imageRequests.delete(request.id);});
   }
-  async repliesIdle(){await Promise.all([this.replyChain,this.imageChain,this.commandChain]);}
+  async repliesIdle(){
+    await Promise.all([this.imageChain,this.commandChain]);
+    while(this.replyRequests.size)await Promise.all([...this.replyRequests.values()]);
+  }
   async close(){this.closed=true;clearInterval(this.timer);this.abort.abort();await this.repliesIdle();while(this.busy)await new Promise(r=>setTimeout(r,20));await this.driver.close?.();}
 }

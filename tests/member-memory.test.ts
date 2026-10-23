@@ -82,7 +82,10 @@ test('same member in two groups waits for delivered memory before generating the
   }},memory);
   try{
     await bridge.groups();bridge.control(false,true);bridge.receive(message());bridge.receive(message(groups[1]!));
-    await until(()=>Boolean(store.next()));assert.equal(calls,1);await bridge.tick();
+    await until(()=>Boolean(store.db.prepare("SELECT 1 FROM jobs WHERE idem LIKE 'reply:%'").get()));assert.equal(calls,1);
+    // A queued receipt can precede the first generated answer. Only delivery of
+    // the answer unlocks the same member's next prompt in another group.
+    while(store.next()&&calls===1)await bridge.tick();
     await bridge.repliesIdle();assert.equal(calls,2);await bridge.tick();assert.equal(memory.history(groups[1]!.id,memory.members(groups[1]!.id)[0]!.id).length,4);
   }finally{await bridge.close();store.close();}
 });

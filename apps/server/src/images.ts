@@ -10,7 +10,7 @@ export interface ImageGenerator {
 }
 
 export class ImageGenerationError extends Error {
-  constructor(readonly reason:'image_quota_exhausted'|'image_rate_limited'|'image_auth_failed'|'image_service_unavailable'|'image_browser_offline'|'image_browser_timeout'|'image_submission_failed'|'image_text_response'|'image_download_failed',readonly httpStatus:number,readonly retryAt?:number){super(reason);}
+  constructor(readonly reason:'image_quota_exhausted'|'image_rate_limited'|'image_auth_failed'|'image_service_unavailable'|'image_browser_offline'|'image_browser_timeout'|'image_page_load_failed'|'image_submission_failed'|'image_text_response'|'image_download_failed',readonly httpStatus:number,readonly retryAt?:number){super(reason);}
 }
 /** Explicit completed model text, never raw provider errors or surrounding page content. */
 export class ImageTextResponse extends ImageGenerationError {
@@ -26,6 +26,7 @@ export function imageErrorReply(error:unknown):string {
   if(!(error instanceof ImageGenerationError))return '图片生成失败，请稍后重试。';
   if(error.reason==='image_browser_offline')return 'Gemini 网页生图未连接，请联系管理员检查浏览器登录。';
   if(error.reason==='image_browser_timeout')return 'Gemini 网页生图超时，请稍后重新发送 /img。';
+  if(error.reason==='image_page_load_failed')return 'Gemini 页面加载失败，本次提示词尚未发送。请稍后重新发送 /img。';
   if(error.reason==='image_download_failed')return '图片已经生成，但下载失败；本次不会重复生图，请联系管理员补发。';
   if(error.reason==='image_submission_failed')return '未能确认 Gemini 已接收提示词，请检查生图网页。本次没有自动重复提交。';
   const reset=error.retryAt&&error.retryAt>Date.now()?new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false}).format(error.retryAt):'';

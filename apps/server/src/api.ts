@@ -67,7 +67,7 @@ export async function createApi(config:Config,bridge:Bridge) {
     res.header('Set-Cookie','bridge_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0');return {ok:true};
   });
   app.get('/api/health',async()=>({ok:true,mode:config.WECHAT_DEVICE_MODE,paused:bridge.paused,auto_reply:bridge.autoReply,
-    image:bridge.imageStatus(),web_search:config.HERMES_WEB_SEARCH,
+    image:bridge.imageStatus(),replies:bridge.replyStatus(),web_search:config.HERMES_WEB_SEARCH,
     memory:{provider:bridge.memory.backend?'hermes':'local',scope:'member'},
     group_memory:{enabled:Boolean(bridge.driver.groupHistory),scope:'group',groups:bridge.groupMemory.states().map(g=>bridge.groupMemory.stats(g.chat_id))},
     reliability:bridge.lastReliability,last_error:bridge.lastError,ai_provider:config.AI_PROVIDER,

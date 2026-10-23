@@ -1,0 +1,8 @@
+{
+  "bot_id": "YOUR_WECOM_BOT_ID",
+  "secret": "YOUR_WECOM_BOT_SECRET",
+  "topic_id": "VERIFIED_CHANNEL_TOPIC_ID",
+  "topic_name": "好东西！",
+  "wechat_accounts": ["YOUR_WECHAT_ACCOUNT"],
+  "bridge_root": "/absolute/path/to/running/WeChatBot"
+}

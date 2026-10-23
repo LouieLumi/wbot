@@ -47,6 +47,16 @@ test('an unconfirmed browser submission is reported distinctly and late results 
   assert.equal((await app.inject({method:'POST',url:'/result',headers,payload:{id:task.id,ok:true,mime_type:'image/png',data:png.toString('base64')}})).statusCode,409);
  }finally{await app.close();}
 });
+test('page load failure reports an unsent prompt distinctly from a generation timeout',async()=>{
+ const images=new GeminiWebImages(),app=createGeminiWorker(config,images);images.heartbeat(true);
+ try{
+  const pending=images.generate('test',new AbortController().signal),task=images.claim(true)!;
+  const outcome=assert.rejects(pending,e=>imageErrorReply(e).includes('页面加载失败，本次提示词尚未发送'));
+  assert.equal((await app.inject({method:'POST',url:'/failure-step',headers,payload:{step:'load'}})).statusCode,200);
+  assert.equal((await app.inject({method:'POST',url:'/result',headers,payload:{id:task.id,ok:false,error:'page_load_failed'}})).statusCode,200);
+  await outcome;assert.equal(images.status().last_error,'image_page_load_failed');assert.equal(images.status().failure_step,'load');
+ }finally{await app.close();}
+});
 test('web image worker preserves long prompts including newlines, emoji and the final instructions',async()=>{
  const images=new GeminiWebImages(),app=createGeminiWorker(config,images);
  const prompt='第一段：\n'+('细节要求🌙\n'.repeat(1000))+'结尾要求不得丢失';

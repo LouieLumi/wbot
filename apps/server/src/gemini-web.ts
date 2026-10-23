@@ -100,7 +100,7 @@ export function createGeminiWorker(config:Config,images:GeminiWebImages){
     images.navigationFailureAt(stage,message);return {ok:true};
   });
   app.post('/failure-step',async req=>{
-    const {step}=z.object({step:z.enum(['start','delete','submit','bind','response','download','rename'])}).strict().parse(req.body);
+    const {step}=z.object({step:z.enum(['load','start','delete','submit','bind','response','download','rename'])}).strict().parse(req.body);
     images.failureStepAt(step);return {ok:true};
   });
   // A diagnostic can operate only on synthetic sessions created here during this
@@ -170,7 +170,7 @@ export function createGeminiWorker(config:Config,images:GeminiWebImages){
       z.object({id:z.string().uuid(),ok:z.literal(true),reset_complete:z.literal(true)}).strict(),
       z.object({id:z.string().uuid(),ok:z.literal(false),error:z.literal('text_response'),text:z.string().trim().min(1).max(2000)}).strict(),
       z.object({id:z.string().uuid(),ok:z.literal(false),error:z.literal('download_failed'),download_status:z.number().int().min(0).max(599)}).strict(),
-      z.object({id:z.string().uuid(),ok:z.literal(false),error:z.enum(['login_required','quota','timeout','page_changed','browser_restarted','generation_failed','submission_failed','conversation_rename_failed','conversation_delete_failed','conversation_conflict'])}).strict()
+      z.object({id:z.string().uuid(),ok:z.literal(false),error:z.enum(['login_required','quota','timeout','page_load_failed','page_changed','browser_restarted','generation_failed','submission_failed','conversation_rename_failed','conversation_delete_failed','conversation_conflict'])}).strict()
     ]).parse(req.body);
     if(value.ok&&'reset_complete' in value){
       return images.complete(value.id,undefined,undefined,true)?{ok:true}:res.code(409).send({error:'task_expired'});
@@ -181,7 +181,7 @@ export function createGeminiWorker(config:Config,images:GeminiWebImages){
     }
     if(!value.ok&&images.active(value.id))images.failure(value.error,'download_status' in value?value.download_status:0);
     const image=value.ok?{mime_type:value.mime_type,data:Buffer.from(value.data,'base64')}:undefined;
-    const reason=!value.ok&&value.error==='download_failed'?'image_download_failed':!value.ok&&value.error==='quota'?'image_quota_exhausted':!value.ok&&value.error==='login_required'?'image_browser_offline':!value.ok&&value.error==='timeout'?'image_browser_timeout':!value.ok&&value.error==='submission_failed'?'image_submission_failed':'image_service_unavailable';
+    const reason=!value.ok&&value.error==='download_failed'?'image_download_failed':!value.ok&&value.error==='quota'?'image_quota_exhausted':!value.ok&&value.error==='login_required'?'image_browser_offline':!value.ok&&value.error==='timeout'?'image_browser_timeout':!value.ok&&value.error==='page_load_failed'?'image_page_load_failed':!value.ok&&value.error==='submission_failed'?'image_submission_failed':'image_service_unavailable';
     const accepted=images.complete(value.id,image,value.ok?undefined:new ImageGenerationError(reason,value.error==='quota'?429:'download_status' in value&&value.download_status?value.download_status:503));
     return accepted?{ok:true}:res.code(409).send({error:'task_expired'});
   });

@@ -22,7 +22,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.zip.ZipFile;
 
-/** Local text/image transport: allowlisted groups only, no screenshot or external service. */
+/** Local transport: independently allowlisted groups and private link requests. */
 public final class LocalBridge {
     private static volatile LocalBridge active;
     private final ClassLoader loader;
@@ -41,6 +41,7 @@ public final class LocalBridge {
     private final File imageDirectory;
     private final Map<String,JSONObject> registrations = new LinkedHashMap<>();
     private volatile Set<String> authorized = Collections.emptySet();
+    private volatile Set<String> privateAuthorized = Collections.emptySet();
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile String pendingGroup;
     private volatile JSONObject networkResult;
@@ -347,6 +348,10 @@ public final class LocalBridge {
         refreshGroups(); if(!groups.containsKey(group)) throw new SecurityException("group_not_allowed");
         if(!signupAck&&!authorized.contains(group))throw new SecurityException("group_not_authorized");
         if(signupAck&&!content.equals("已发起使用请求"))throw new SecurityException("invalid_signup_ack");
+        return sendReserved(group,content,id);
+    }
+
+    private JSONObject sendReserved(String group,String content,String id) throws Exception {
         // Persist before publishing, including across WeChat restarts.
         TextSendLedger.Receipt receipt;
         try{receipt=textSends.reserve(id,group,content);}
@@ -366,6 +371,88 @@ public final class LocalBridge {
             }
         }
         return result;
+    }
+
+    private boolean knownFriend(Object database,String user) throws Throwable {
+        if(user==null||!user.matches("[A-Za-z0-9_.-]{1,128}")||user.startsWith("gh_")||user.equals("filehelper"))return false;
+        try(Cursor contact=query(database,"SELECT type FROM rcontact WHERE username=? LIMIT 1",user)){
+            return contact.moveToFirst()&&(contact.getInt(0)&1)!=0;
+        }
+    }
+    private JSONObject authorizePrivate(JSONObject request) throws Exception {
+        JSONArray ids=request.getJSONArray("user_ids");
+        if(ids.length()>20)throw new IllegalArgumentException("private_authorization_limit");
+        Set<String> updated=new HashSet<>();
+        for(int i=0;i<ids.length();i++){
+            String user=ids.getString(i);boolean known=false;
+            for(Object database:databases.values())try{if(knownFriend(database,user))known=true;}catch(Throwable ignored){}
+            if(!known)throw new SecurityException("private_contact_not_verified");
+            updated.add(user);
+        }
+        privateAuthorized=Collections.unmodifiableSet(updated);
+        return new JSONObject().put("ok",true).put("generation",generation);
+    }
+    /** Match only the fresh, exact one-time pairing phrase supplied on the host.
+     * No other private text is returned or scanned into the bot's history. */
+    private JSONObject pairPrivate(JSONObject request) throws Exception {
+        String content=request.getString("content");long since=request.getLong("since"),now=System.currentTimeMillis();
+        if(!content.matches("绑定发帖 [a-f0-9]{8}")||since<now-1800000L||since>now+60000)throw new IllegalArgumentException("invalid_pairing");
+        Set<String> matches=new HashSet<>();int queried=0,found=0,friends=0;JSONArray times=new JSONArray();
+        for(Object database:databases.values()){
+            try(Cursor records=query(database,"SELECT talker,createTime FROM message WHERE isSend=0 AND type=1 AND content=? ORDER BY msgId DESC LIMIT 3",content)){
+                queried++;
+                while(records.moveToNext()){
+                    found++;String user=records.getString(0);long time=records.getLong(1);
+                    times.put(time);
+                    if(knownFriend(database,user)){
+                        friends++;
+                        if(time>=since&&time<=now+60000L)matches.add(user);
+                    }
+                }
+            }catch(Throwable error){Log.w("NilaWeChatHook","private_pairing_failed:"+error.getClass().getSimpleName());}
+        }
+        return new JSONObject().put("verified",matches.size()==1)
+            .put("username",matches.size()==1?matches.iterator().next():JSONObject.NULL)
+            .put("queried",queried).put("matched_messages",found).put("friend_matches",friends).put("timestamps",times);
+    }
+    private JSONObject sendPrivate(JSONObject request) throws Exception {
+        String user=request.getString("user_id"),content=request.getString("content"),id=request.getString("id");
+        if(!privateAuthorized.contains(user))throw new SecurityException("private_not_authorized");
+        if(!id.matches("[A-Za-z0-9_:.\\-]{8,150}")||content.trim().isEmpty()||content.length()>2000)throw new IllegalArgumentException("invalid_private_send");
+        boolean known=false;
+        for(Object database:databases.values())try{if(knownFriend(database,user))known=true;}catch(Throwable ignored){}
+        if(!known)throw new SecurityException("private_contact_not_verified");
+        return sendReserved(user,content,id);
+    }
+    /** Text and ordinary shared-link cards only; never return unrelated private chats. */
+    private JSONObject privateHistory(JSONObject request) throws Exception {
+        String user=request.getString("user_id"),requestedSource=request.optString("source","");
+        long since=request.getLong("since"),after=request.getLong("after"),now=System.currentTimeMillis();
+        if(!privateAuthorized.contains(user))throw new SecurityException("private_not_authorized");
+        if(since<0||since>now+60000||after<0)throw new IllegalArgumentException("invalid_private_cursor");
+        since=Math.max(since,now-86400000L);
+        for(Map.Entry<String,Object> entry:databases.entrySet()){
+            try{
+                Object database=entry.getValue();if(!knownFriend(database,user))continue;
+                StringBuilder hex=new StringBuilder();
+                for(byte b:MessageDigest.getInstance("SHA-256").digest(entry.getKey().getBytes(StandardCharsets.UTF_8)))hex.append(String.format(Locale.ROOT,"%02x",b&255));
+                String source=hex.toString();long cursor=source.equals(requestedSource)?after:0;
+                JSONArray rows=new JSONArray();int scanned=0;
+                try(Cursor records=query(database,"SELECT msgId,createTime,content,type,msgSvrId FROM message WHERE talker=? AND isSend=0 AND type IN (1,49) AND msgId>? AND createTime>=? AND createTime<=? ORDER BY msgId ASC LIMIT 50",user,cursor,since,now)){
+                    while(records.moveToNext()){
+                        scanned++;cursor=records.getLong(0);String content=records.getString(2);
+                        if(content==null||content.length()>100000)continue;
+                        if(records.getInt(3)==49)content=PrivateLinkCard.extract(content);
+                        if(content==null||content.length()>8000)continue;
+                        long server=records.getLong(4);
+                        rows.put(new JSONObject().put("message_id",user+":"+(server>0?"s"+server:"l"+cursor))
+                            .put("user_id",user).put("content",content).put("timestamp",records.getLong(1)));
+                    }
+                }
+                return new JSONObject().put("source",source).put("cursor",cursor).put("has_more",scanned==50).put("messages",rows);
+            }catch(Throwable error){Log.w("NilaWeChatHook","private_history_failed:"+error.getClass().getSimpleName());}
+        }
+        throw new IllegalStateException("private_database_unavailable");
     }
 
     private JSONObject publishText(String group,String content) throws Exception {
@@ -537,7 +624,15 @@ public final class LocalBridge {
                 URI uri=new URI(request[1]); JSONObject result;
                 if(request[0].equals("GET")&&uri.getPath().equals("/status")) {
                     result=new JSONObject().put("connected",true).put("mode","android_hook").put("generation",generation)
-                        .put("api_version",6).put("group_history_supported",true).put("text_receipts","persistent").put("identity_supported",true).put("image_supported",true).put("signup_supported",true).put("database_handles",databases.size()).put("authorized_groups",authorized.size()).put("events",sequence);
+                        .put("api_version",7).put("private_links_supported",true).put("private_pairing_supported",true).put("group_history_supported",true).put("text_receipts","persistent").put("identity_supported",true).put("image_supported",true).put("signup_supported",true).put("database_handles",databases.size()).put("authorized_groups",authorized.size()).put("events",sequence);
+                } else if(request[0].equals("POST")&&uri.getPath().equals("/private/pairing")) {
+                    result=pairPrivate(new JSONObject(new String(bytes,StandardCharsets.UTF_8)));
+                } else if(request[0].equals("POST")&&uri.getPath().equals("/private/authorization")) {
+                    result=authorizePrivate(new JSONObject(new String(bytes,StandardCharsets.UTF_8)));
+                } else if(request[0].equals("POST")&&uri.getPath().equals("/private/history")) {
+                    result=privateHistory(new JSONObject(new String(bytes,StandardCharsets.UTF_8)));
+                } else if(request[0].equals("POST")&&uri.getPath().equals("/private/send")) {
+                    result=sendPrivate(new JSONObject(new String(bytes,StandardCharsets.UTF_8)));
                 } else if(request[0].equals("POST")&&uri.getPath().equals("/identity/resolve")) {
                     result=resolveIdentity(new JSONObject(new String(bytes,StandardCharsets.UTF_8)));
                 } else if(request[0].equals("GET")&&uri.getPath().equals("/groups")) {

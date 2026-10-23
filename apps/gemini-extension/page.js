@@ -1,4 +1,5 @@
 (() => {
+  const pageVersion='1.3.12';
   let running=false,activeTask,generationAbort,activeAnchor;
   const documentId=Date.now().toString(36)+Math.random().toString(36).slice(2);
   const editor=()=>document.querySelector('[contenteditable="true"][role="textbox"]');
@@ -36,9 +37,22 @@
     const text=reply.querySelector('message-content .markdown')?.innerText.trim()||'';
     // Feedback/copy controls appear when the response has finished. Never forward
     // prompt text, a streaming preamble, navigation labels or previous replies.
-    const completed=[...reply.querySelectorAll('button')].some(b=>visible(b)&&/^(答得好|Good response|复制|Copy)$/i.test(label(b).trim()));
+    const completed=[...reply.querySelectorAll('button')].some(b=>visible(b)&&
+      [b.getAttribute('aria-label')||'',b.innerText||''].some(value=>/^(答得好|Good response|复制|Copy)$/i.test(value.trim())));
     if(text&&completed)return {text:text.length>2000?text.slice(0,1990)+'…':text};
+    // Some Gemini refusals remain aria-busy and never gain feedback controls.
+    // Pass only explicit refusal text to the stability check, never a preamble.
+    if(text&&/(?:无法|不能|不支持|不能帮助|不能协助).{0,24}(?:生成|创建|绘制).{0,24}(?:图像|图片|图画)|(?:can't|cannot|unable to).{0,24}(?:generate|create|draw).{0,24}(?:image|picture)/i.test(text))return {refusal:text.slice(0,2000)};
     return null;
+  };
+  const settledResponse=anchor=>{
+    let previous='',since=0;
+    return ()=>{
+      const result=readResponse(anchor);
+      if(!result?.refusal){previous='';return result;}
+      if(previous!==result.refusal){previous=result.refusal;since=Date.now();}
+      return Date.now()-since>=5000?{text:result.refusal}:null;
+    };
   };
   const waitFor=(check,timeout,error='timeout',stableMs=0,signal=generationAbort?.signal)=>new Promise((resolve,reject)=>{
     let candidate,since=0;
@@ -59,6 +73,24 @@
     document.addEventListener('load',probe,true);probe();
   });
   const currentConversation=()=>/^\/app\/[A-Za-z0-9_-]+$/.test(location.pathname)?'https://gemini.google.com'+location.pathname:null;
+  const emptyTranscript=()=>!!editor()&&!stop()&&!promptText(editorText(editor())||'')&&document.querySelectorAll('user-query,model-response').length===0;
+  const emptyLanding=()=>location.pathname==='/app'&&emptyTranscript();
+  const emptyConversation=()=>!!currentConversation()&&emptyTranscript();
+  async function existingConversation(task){
+    const expected=task.page_url.split('#')[0];
+    let state;try{state=await waitFor(()=>{
+      if(currentConversation()===expected&&document.querySelectorAll('user-query').length>0&&document.querySelectorAll('model-response').length>0&&!stop())return 'loaded';
+      if(emptyLanding())return 'unavailable';
+      return false;
+    },Math.max(1000,Math.min(45_000,task.expires-Date.now()-5000)),'page_changed',500);
+    }catch(error){
+      // The editor can be usable while the conversation fetch has stalled.
+      // Refresh this exact saved conversation before inserting any prompt.
+      if(error.message==='page_changed'&&currentConversation()===expected&&emptyConversation())throw Error('conversation_load_failed');
+      throw error;
+    }
+    if(state==='unavailable')throw Error('conversation_unavailable');
+  }
   const currentLink=()=>[...document.querySelectorAll('a[href]')].find(a=>a.getAttribute('href')===location.pathname);
   const dialog=()=>[...document.querySelectorAll('[role="dialog"]')].find(visible);
   async function conversationMenu(item,error){
@@ -89,7 +121,13 @@
     if(currentConversation()!==expected||!dialog()||!/(删除对话|Delete chat|Delete conversation)/i.test(dialog().innerText))throw Error('conversation_delete_failed');
     confirm.click();
     const path=new URL(expected).pathname;
-    await waitFor(()=>!dialog()&&currentConversation()!==expected&&![...document.querySelectorAll('a[href]')].some(a=>a.getAttribute('href')===path),15_000,'conversation_delete_failed',500);
+    const removed=()=>!dialog()&&![...document.querySelectorAll('a[href]')].some(a=>a.getAttribute('href')===path);
+    const cleared=()=>!!editor()&&!stop()&&document.querySelectorAll('user-query,model-response').length===0;
+    await waitFor(()=>removed()&&(currentConversation()!==expected||cleared()),15_000,'conversation_delete_failed',500);
+    // Gemini can clear a deleted conversation while keeping the old address.
+    // Report this only after clicking its confirmation and observing both the
+    // transcript and sidebar entry disappear. The worker owns the next navigation.
+    return {cleared:currentConversation()===expected};
   }
   async function bindConversation(task){
     if(!task.conversation_title)return;
@@ -158,7 +196,10 @@
       // acknowledgement. Require a turn added after the pre-submission history.
       const accepted=current.slice(queryCount).find(q=>queryText(q.innerText).includes(queryText(text)));
       return accepted&&(!promptText(editor()?.innerText||'')||stop()||[...document.querySelectorAll('model-response')].some(r=>!previous.has(r)))&&{index:current.indexOf(accepted),text:queryText(text)};
-    },12_000,'submission_failed');
+    // Gemini may accept a click only after a slow route/network transition. Keep
+    // ownership until the task deadline; a short timeout loses a late accepted
+    // request and its image. Do not click again while acknowledgement is pending.
+    },Math.max(1000,task.expires-Date.now()-5000),'submission_failed');
     return anchor;
   }
   async function downloadImage(currentImage,signal,expires){
@@ -201,7 +242,16 @@
     }
     throw failure;
   }
-  const status=()=>({ready:!!editor()&&!stop(),busy:running,protocol:4,document_id:documentId});
+  const status=()=>{
+    const input=editor(),generating=!!stop();
+    const hasDraft=!!promptText(input?editorText(input):[...document.querySelectorAll('textarea,input')].filter(visible).map(e=>e.value||'').join(''));
+    // The static loading shell has no real editor, transcript or actionable
+    // controls. Do not refresh login screens, drafts or an ongoing generation.
+    const emptyShell=!input&&!running&&!generating&&!hasDraft&&/^\/app(?:\/[A-Za-z0-9_-]+)?$/.test(location.pathname)&&
+      !document.querySelectorAll('user-query,model-response').length&&!buttons().length&&
+      ![...document.querySelectorAll('a[href],[role="dialog"]')].some(visible);
+    return {ready:!!input&&!generating,empty_landing:emptyLanding(),empty_shell:emptyShell,has_draft:hasDraft,generating,busy:running,protocol:4,page_version:pageVersion,document_id:documentId};
+  };
   chrome.runtime.onMessage.addListener((m,_,reply)=>{
     if(m.kind==='status')reply(status());
     if(m.kind==='capture-conversation'&&m.id===activeTask){
@@ -219,14 +269,14 @@
       let blob;
       if(task.operation==='delete'){
         step='delete';
-        await deleteConversation(task);result={id:task.id,ok:true,deleted:true};
+        const deleted=await deleteConversation(task);result={id:task.id,ok:true,deleted:true,...deleted};
       }else if(task.image_url){
         step='download';
         blob=await downloadImage(()=>({src:task.image_url}),generationAbort.signal,task.expires);
       }else{
-        if(task.conversation_title&&currentConversation()){
+        if(task.conversation_title&&/^https:\/\/gemini\.google\.com\/app\//.test(task.page_url||'')){
           step='rename';
-          await waitFor(()=>document.querySelectorAll('user-query').length>0&&!stop(),20_000,'page_changed');
+          await existingConversation(task);
           await renameConversation(task.conversation_title);
         }
         // Page text is data. Only this request's submitted turn is read.
@@ -235,12 +285,13 @@
         await bindConversation(task);
         step='response';
         let conversationPath=/^\/app\/[^/]+$/.test(location.pathname)?location.pathname:undefined;
+        const response=settledResponse(anchor);
         const found=await waitFor(()=>{
           if(/^\/app\/[^/]+$/.test(location.pathname)){
             if(conversationPath&&location.pathname!==conversationPath)throw Error('page_changed');
             conversationPath=location.pathname;
           }else if(conversationPath)throw Error('page_changed');
-          return readResponse(anchor);
+          return response();
         },Math.max(1000,task.expires-Date.now()-5000));
         if(task.operation==='reset')result={id:task.id,ok:true,reset_complete:true};
         else if(found.text)result={id:task.id,ok:false,error:'text_response',text:found.text};
@@ -252,10 +303,10 @@
         const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(blob);});
         result={id:task.id,ok:true,mime_type:blob.type,data};
       }
-    }catch(e){result={id:task.id,ok:false,error:['login_required','quota','timeout','page_changed','submission_failed','download_failed','conversation_rename_failed','conversation_delete_failed'].includes(e.message)?e.message:'generation_failed',...(e.message==='download_failed'?{download_status:e.download_status||0}:{})};}
+    }catch(e){result={id:task.id,ok:false,error:['login_required','quota','timeout','page_changed','conversation_unavailable','conversation_load_failed','submission_failed','download_failed','conversation_rename_failed','conversation_delete_failed'].includes(e.message)?e.message:'generation_failed',...(e.message==='download_failed'?{download_status:e.download_status||0}:{})};}
     try{
       while(!generationAbort.signal.aborted&&Date.now()<task.expires){
-        const ack=await chrome.runtime.sendMessage({kind:'result',result,step,submitted:Boolean(activeAnchor),pageUrl:location.href,document_id:documentId}).catch(()=>null);
+        const ack=await chrome.runtime.sendMessage({kind:'result',result,step,submitted:Boolean(activeAnchor),empty_landing:emptyLanding(),empty_conversation:emptyConversation(),pageUrl:location.href,document_id:documentId}).catch(()=>null);
         if(ack?.ok||ack?.ignored||ack?.expired)break;
         await new Promise(resolve=>setTimeout(resolve,2000));
       }
