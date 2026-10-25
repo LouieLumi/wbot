@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Nila · 管理后台</title><link rel="stylesheet" href="/admin.css"><script src="/admin.js" defer></script></head>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Gemini · 管理后台</title><link rel="stylesheet" href="/admin.css"><script src="/admin.js" defer></script></head>
 <body>
 <svg class="icon-defs" aria-hidden="true"><defs>
 <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
@@ -13,11 +13,11 @@
 <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10" cy="10" r="6"/><path d="m15 15 6 6"/></symbol>
 <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></symbol>
 </defs></svg>
-<section id="login" class="login hidden"><div class="brand-mark">N</div><h1>Nila 管理后台</h1><p id="login-error" class="login-status" role="alert">请登录</p><form id="login-form"><label for="password">管理密码</label><input type="password" id="password" name="password" autocomplete="current-password" maxlength="256" required><button class="primary" type="submit">登录</button></form><details><summary>本机快捷登录</summary><code>npm run admin</code></details></section>
+<section id="login" class="login hidden"><div class="brand-mark">G</div><h1>Gemini 管理后台</h1><p id="login-error" class="login-status" role="alert">请登录</p><form id="login-form"><label for="password">管理密码</label><input type="password" id="password" name="password" autocomplete="current-password" maxlength="256" required><button class="primary" type="submit">登录</button></form><details><summary>本机快捷登录</summary><code>npm run admin</code></details></section>
 <div id="app" class="shell hidden">
-<aside class="sidebar"><a class="brand" href="#overview"><span class="brand-mark">N</span><span>Nila<small>管理后台</small></span></a><div class="nav-label">工作空间</div><nav aria-label="主导航">
+<aside class="sidebar"><a class="brand" href="#overview"><span class="brand-mark">G</span><span>Gemini<small>管理后台</small></span></a><div class="nav-label">工作空间</div><nav aria-label="主导航">
 <button class="nav active" data-view="overview"><svg><use href="#i-grid"/></svg>总览</button><button class="nav" data-view="groups"><svg><use href="#i-group"/></svg>群聊管理<span id="nav-group-count" class="nav-count">0</span></button><button class="nav" data-view="memory"><svg><use href="#i-memory"/></svg>成员记忆</button><button class="nav" data-view="models"><svg><use href="#i-model"/></svg>模型管理</button><button class="nav" data-view="jobs"><svg><use href="#i-list"/></svg>发送记录</button><button class="nav" data-view="commands"><svg><use href="#i-command"/></svg>命令管理</button>
-</nav><div class="sidebar-bottom"><div class="account-avatar">N</div><div><strong id="bot-name">Nila</strong><span id="sidebar-status">连接中</span></div><button id="logout" class="icon-button" aria-label="退出登录" title="退出登录">↪</button></div></aside>
+</nav><div class="sidebar-bottom"><div class="account-avatar">G</div><div><strong id="bot-name">Gemini</strong><span id="sidebar-status">连接中</span></div><button id="logout" class="icon-button" aria-label="退出登录" title="退出登录">↪</button></div></aside>
 <div class="workspace"><header class="topbar"><div class="breadcrumb">控制台<span>/</span><strong id="breadcrumb-page">总览</strong></div><div class="topbar-right"><span id="status-pill" class="badge neutral">连接中</span><button id="refresh" class="icon-button" aria-label="刷新数据" title="刷新数据"><svg><use href="#i-refresh"/></svg></button></div></header>
 <main><div class="page-heading"><div><div class="page-kicker" id="page-kicker">OVERVIEW</div><h1 id="page-title">总览</h1></div><div class="heading-actions"><span id="updated-at" class="muted"></span><button id="pause" class="secondary">暂停机器人</button></div></div>
 <div id="connection-error" class="banner hidden" role="alert"></div>

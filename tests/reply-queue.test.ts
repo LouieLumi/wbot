@@ -6,6 +6,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Bridge} from '../apps/server/src/bridge.js';
 import {Store} from '../apps/server/src/store.js';
+import {ReplyQueue} from '../apps/server/src/reply-queue.js';
 import {readConfig} from '../apps/server/src/config.js';
 import type {Responder} from '../apps/server/src/openclaw.js';
 import type {Message,DeviceAdapter} from '../packages/shared/types.js';
@@ -115,4 +116,22 @@ test('live events are processed before history; many groups archive one page per
     await s.bridge.tick();assert.deepEqual(order.filter(t=>t.startsWith('history:')),groups.map(g=>'history:'+g.id));
     await drain(s);
   }finally{await s.close();}
+});
+
+test('voice busy receipt decisions survive restart and old reply queues migrate without losing prompts',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'wbot-voice-queue-')),path=join(dir,'bridge.sqlite');let store=new Store(path);
+  try{
+    store.db.exec(`CREATE TABLE reply_requests(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,
+      chat_id TEXT NOT NULL,member_id TEXT NOT NULL,revision INTEGER NOT NULL,message TEXT NOT NULL,
+      state TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)`);
+    const old=message('old'),busy=message('busy');
+    store.db.prepare("INSERT INTO reply_requests(id,chat_id,member_id,revision,message,state,created_at,updated_at) VALUES(?,?,?,?,?,'queued',1,1)")
+      .run(old.message_id,old.chat_id,'old',0,JSON.stringify(old));
+    const queue=new ReplyQueue(store);queue.add(busy,'busy',0,true);
+    store.close();store=new Store(path);
+    const restored=new ReplyQueue(store).waiting();
+    assert.deepEqual(restored.map(r=>({id:r.id,voice_blocked:r.voice_blocked})),[
+      {id:old.message_id,voice_blocked:false},{id:busy.message_id,voice_blocked:true}]);
+    assert.deepEqual(restored.map(r=>r.message),[old,busy]);
+  }finally{store.close();rmSync(dir,{recursive:true,force:true});}
 });

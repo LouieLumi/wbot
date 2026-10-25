@@ -19,7 +19,7 @@ const memory=new Memories(store,config.AI_PROVIDER==='hermes'?new HermesMemberMe
 memory.reconcile();
 const responder=config.AI_PROVIDER==='hermes'?new Hermes(config,memory,models):config.AI_PROVIDER==='ollama'?new Ollama(config,memory,models):new OpenClaw(config);
 const driver=config.WECHAT_DEVICE_MODE==='mock'?new MockDriver():config.WECHAT_DEVICE_MODE==='android_hook'?new AndroidHookDriver(config):new AdbDriver(config);
-const webImages=config.IMAGE_PROVIDER==='gemini_web'?new GeminiWebImages():undefined;
+const webImages=config.IMAGE_PROVIDER==='gemini_web'?new GeminiWebImages(undefined,undefined,store):undefined;
 const bridge=new Bridge(config,driver,store,responder,memory,models,webImages);
 // Keep the management page available while the USB phone reconnects.
 try{await bridge.groups();}catch{bridge.lastError='device_unavailable_or_unverified';}

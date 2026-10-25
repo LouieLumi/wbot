@@ -9,6 +9,7 @@ import {Store} from '../apps/server/src/store.js';
 import {Memories} from '../apps/server/src/memory.js';
 import {Bridge} from '../apps/server/src/bridge.js';
 import type {Message,DeviceAdapter} from '../packages/shared/types.js';
+import {isBotReply,replyInput} from '../apps/server/src/reply-context.js';
 
 const group={id:'123@chatroom',name:'测试群',type:'group' as const,verified:true};
 const message=(seq:number):Message&{seq:number}=>({event:'message.received',message_id:'123:s'+seq,chat_id:group.id,chat_name:group.name,
@@ -63,5 +64,41 @@ test('event adapter bypasses UI and commits memory only after a server-confirmed
     const member=bridge.memory.members(group.id)[0]!;assert.equal(bridge.memory.history(group.id,member.id).length,0);
     await bridge.tick();assert.equal(attempts,1);assert.equal(bridge.memory.history(group.id,member.id).length,2);
     events=[message(1)];await bridge.tick();await bridge.repliesIdle();assert.equal(called,1);
+  }finally{await bridge.close();store.close();}
+});
+
+test('verified bot quotes wake without an @, preserve context, deduplicate and remain group-scoped',async()=>{
+  const store=new Store(':memory:');const seen:Message[]=[];
+  const quote:Message={...message(70),message_id:group.id+':s70',content:'这是什么意思？',mention:'reply',reply_to:{message_id:group.id+':s50',content:'/stop\n青蛙是两栖动物',type:'text',own:true}};
+  const driver:DeviceAdapter={status:async()=>({}),chats:async()=>[group],snapshot:async()=>{throw Error('no UI');},
+    pollEvents:async()=>({messages:[],reliability:'code_events'}),quotedReply:async()=>quote,send:async()=>({state:'sent',reason:'wechat_server_ack'})};
+  const bridge=new Bridge(config(),driver,store,{reply:async m=>{seen.push(m);return '它既能在水里生活，也能在陆地活动。';}});
+  bridge.control(false,true);
+  try{
+    await bridge.groups();assert.equal((await bridge.recoverQuotedReply(group.id,quote.message_id)).accepted,true);
+    await bridge.repliesIdle();assert.equal(seen.length,1);assert.equal(seen[0]?.content,'这是什么意思？');
+    assert.equal(bridge.memory.group(group.id)?.paused,false);assert.match(replyInput(seen[0]!),/青蛙/);
+    await bridge.tick();const member=bridge.memory.members(group.id)[0]!;
+    assert.equal(bridge.memory.history(group.id,member.id).length,0);
+    assert.equal(store.db.prepare('SELECT count(*) AS n FROM group_answers').get()?.n,1);
+    await bridge.recoverQuotedReply(group.id,quote.message_id);await bridge.repliesIdle();assert.equal(seen.length,1);
+    bridge.receive({...quote,message_id:group.id+':s71',reply_to:undefined});
+    bridge.receive({...quote,message_id:group.id+':s72',reply_to:{...quote.reply_to!,message_id:'other@chatroom:s50'}});
+    bridge.receive({...quote,message_id:group.id+':s73',own:true});
+    await bridge.repliesIdle();assert.equal(seen.length,1);
+    assert(!isBotReply({...quote,reply_to:{...quote.reply_to!,message_id:'other@chatroom:s50'}}));
+    assert.equal(replyInput({...quote,reply_to:undefined}),'这是什么意思？');
+  }finally{await bridge.close();store.close();}
+});
+
+test('quoted commands use current sender permissions; quoted old commands never execute',async()=>{
+  const store=new Store(':memory:');let calls=0;
+  const driver:DeviceAdapter={status:async()=>({}),chats:async()=>[group],snapshot:async()=>{throw Error('no UI');},send:async()=>({state:'sent',reason:'wechat_server_ack'})};
+  const bridge=new Bridge(config(),driver,store,{reply:async()=>{calls++;return 'reply';}});bridge.control(false,true);
+  try{
+    await bridge.groups();
+    bridge.receive({...message(90),message_id:group.id+':s90',mention:'reply',content:'/stop',reply_to:{message_id:group.id+':s50',content:'你好',type:'text',own:true}});
+    await bridge.repliesIdle();assert.equal(calls,0);assert.equal(bridge.memory.group(group.id)?.paused,false);
+    assert.match(String(store.db.prepare('SELECT content FROM jobs LIMIT 1').get()?.content),/管理员/);
   }finally{await bridge.close();store.close();}
 });

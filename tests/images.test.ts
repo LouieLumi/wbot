@@ -248,11 +248,11 @@ test('a verified member gets their WeChat ID title across groups; reset deletes 
   s.bridge.receive({...message('/newimg',second),sender:'新昵称'});await ready;
   s.bridge.receive(message('/img second'));
   assert.equal(calls.length,2);assert.equal(calls[1]!.title,'wxid_alice的对话');assert.deepEqual(calls[1]!.old,[old]);
-  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已删除旧生图对话%'").get()!.n,0);
+  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已重建生图对话%'").get()!.n,0);
   release();await s.bridge.repliesIdle();
   assert.deepEqual(calls.map(c=>c.kind),['image','reset','image']);
   assert.equal(calls[1]!.session,calls[2]!.session);assert.notEqual(old,calls[2]!.session);assert.deepEqual(calls[2]!.old,[]);
-  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已删除旧生图对话%'").get()!.n,1);
+  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已重建生图对话%'").get()!.n,1);
   assert.equal(s.store.db.prepare("SELECT state FROM jobs WHERE content='[图片] first'").get()!.state,'failed');
  }finally{release?.();await s.close();}
 });
@@ -285,7 +285,7 @@ test('failed Gemini deletion never reports a completed reset and keeps cleanup p
   s.bridge.receive(message('/newimg'));await s.bridge.repliesIdle();
   const member=s.bridge.memory.members(group.id)[0]!;
   assert.equal(s.bridge.memory.imageContext(group.id,member.id).retired_sessions.length,1);
-  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已删除旧生图对话%'").get()!.n,0);
+  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已重建生图对话%'").get()!.n,0);
   assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '生图对话重建未完成%'").get()!.n,1);
  }finally{await s.close();}
 });
@@ -297,7 +297,7 @@ test('/newimg remains available while group replies are stopped',async()=>{
   await s.bridge.groups();s.bridge.memory.groupControl(group.id,true);
   s.bridge.receive(message('/newimg'));await s.bridge.repliesIdle();
   assert.equal(resets,1);
-  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已删除旧生图对话%'").get()!.n,1);
+  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已重建生图对话%'").get()!.n,1);
  }finally{await s.close();}
 });
 
@@ -314,7 +314,7 @@ test('repeated cross-group resets finish an in-flight deletion before retiring i
   assert.equal(calls[0]!.signal.aborted,false);
   release();await s.bridge.repliesIdle();
   assert.equal(calls.length,2);assert(calls[1]!.old.includes(calls[0]!.session));
-  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已删除旧生图对话%'").get()!.n,1);
+  assert.equal(s.store.db.prepare("SELECT count(*) n FROM jobs WHERE content LIKE '已重建生图对话%'").get()!.n,1);
  }finally{release?.();await s.close();}
 });
 

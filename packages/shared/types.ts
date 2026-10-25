@@ -3,14 +3,16 @@ export interface Chat { id: string; name: string; type: ChatType; verified: bool
 export interface Message {
   event: 'message.received'; message_id: string; chat_id: string; chat_name: string;
   chat_type: ChatType; sender: string | null; content: string;
-  own: boolean | null; mention: 'verified' | 'text' | 'none' | 'unknown'; timestamp: number;
+  own: boolean | null; mention: 'verified' | 'text' | 'reply' | 'none' | 'unknown'; timestamp: number;
   member_id?: string; avatar_hash?: string; sender_wxid?: string;
+  reply_to?: {message_id:string;content:string;type:'text'|'image'|'other';own:true};
 }
 export interface Row { key: string; sender: string | null; content: string; own: boolean | null; mention: Message['mention']; avatar_hash?:string }
 export interface Snapshot { chat: Chat | null; rows: Row[]; reliability: string }
 export type JobState = 'queued' | 'running' | 'sent' | 'failed' | 'uncertain';
 export interface SendResult { state: 'sent' | 'failed' | 'uncertain'; reason: string }
 export interface GeneratedImage {mime_type:'image/png'|'image/jpeg'|'image/webp';data:Uint8Array}
+export interface GeneratedVoice {mime_type:'audio/silk';data:Uint8Array;duration_ms:number}
 export interface SignupRequest { request_id:string; chat_id:string; chat_name:string; requested_at:number }
 export interface GroupText {local_id:number;sender_id:string;sender:string;content:string;timestamp:number;truncated:boolean}
 export interface GroupHistory {chat_id:string;source:string;cursor:number;has_more:boolean;messages:GroupText[]}
@@ -27,7 +29,9 @@ export interface DeviceAdapter {
   acknowledgeSignup?(request:SignupRequest):Promise<SendResult>;
   setAuthorized?(ids:string[]):Promise<void>;
   resolveAccount?(wechatId:string):Promise<string|null>;
+  quotedReply?(chat:string,messageId:string):Promise<Message|null>;
   send(chat: Chat, content: string, id?:string): Promise<SendResult>;
   sendImage?(chat:Chat,image:GeneratedImage,id:string):Promise<SendResult>;
+  sendVoice?(chat:Chat,voice:GeneratedVoice,id:string):Promise<SendResult>;
   close?(): Promise<void>;
 }

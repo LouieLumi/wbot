@@ -2,8 +2,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID,createHash } from 'node:crypto';
-import type { GeneratedImage,Job, JobState } from '../../../packages/shared/types.js';
+import type { GeneratedImage,GeneratedVoice,Job, JobState } from '../../../packages/shared/types.js';
 import {validateImage} from './images.js';
+import {validateVoice} from './voice.js';
 export class Store {
   readonly db: DatabaseSync;
   constructor(readonly path: string) {
@@ -16,6 +17,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS seen(id TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS job_images(job_id TEXT PRIMARY KEY,mime_type TEXT NOT NULL,data BLOB,sha256 TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS job_voices(job_id TEXT PRIMARY KEY,mime_type TEXT NOT NULL,data BLOB,sha256 TEXT NOT NULL,duration_ms INTEGER NOT NULL);
       UPDATE jobs SET state='uncertain',reason='interrupted_before_confirmation' WHERE state='running';`);
   }
   enqueueImage(chatId:string,prompt:string,image:GeneratedImage,idem:string,stage?:(job:Job)=>void):Job{
@@ -36,6 +38,18 @@ export class Store {
   image(id:string):GeneratedImage|null|undefined{
     const image=this.db.prepare('SELECT mime_type,data FROM job_images WHERE job_id=?').get(id) as {mime_type:GeneratedImage['mime_type'];data:Uint8Array|null}|undefined;
     return image?(image.data?{mime_type:image.mime_type,data:image.data}:null):undefined;
+  }
+  attachVoice(job:Job,voice:GeneratedVoice){
+    validateVoice(voice);
+    const hash=createHash('sha256').update(voice.data).digest('hex');
+    const previous=this.db.prepare('SELECT sha256,duration_ms FROM job_voices WHERE job_id=?').get(job.id) as {sha256:string;duration_ms:number}|undefined;
+    if(previous&&(previous.sha256!==hash||previous.duration_ms!==voice.duration_ms))throw Error('idempotency_conflict');
+    this.db.prepare('INSERT OR IGNORE INTO job_voices VALUES(?,?,?,?,?)').run(job.id,voice.mime_type,voice.data,hash,voice.duration_ms);
+    this.db.prepare("UPDATE job_voices SET data=NULL WHERE data IS NOT NULL AND job_id IN (SELECT id FROM jobs WHERE state IN ('sent','failed','uncertain') AND updated_at<?)").run(Date.now()-7*86400_000);
+  }
+  voice(id:string):GeneratedVoice|null|undefined{
+    const value=this.db.prepare('SELECT mime_type,data,duration_ms FROM job_voices WHERE job_id=?').get(id) as GeneratedVoice|undefined;
+    return value?(value.data?value:null):undefined;
   }
   enqueue(chatId: string, content: string, idem?: string): Job {
     if (idem) {

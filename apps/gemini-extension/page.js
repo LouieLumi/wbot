@@ -1,6 +1,6 @@
 (() => {
-  const pageVersion='1.3.12';
-  let running=false,activeTask,generationAbort,activeAnchor;
+  const pageVersion='1.4.1';
+  let running=false,activeTask,generationAbort,activeAnchor,renameDeadline;
   const documentId=Date.now().toString(36)+Math.random().toString(36).slice(2);
   const editor=()=>document.querySelector('[contenteditable="true"][role="textbox"]');
   const visible=e=>e instanceof HTMLElement&&e.getClientRects().length>0;
@@ -63,7 +63,7 @@
       if(Date.now()-since>=stableMs){cleanup();resolve(result);}
     }catch(e){cleanup();reject(e);}};
     const observer=new MutationObserver(probe);
-    const timer=setTimeout(()=>{cleanup();reject(Error(error));},timeout);
+    const timer=setTimeout(()=>{cleanup();reject(Error(error));},Math.max(1,Math.min(timeout,renameDeadline?renameDeadline-Date.now():Infinity)));
     // A quiet DOM or a property-only change must not leave a readiness check stuck.
     const poll=setInterval(probe,100);
     const cancel=()=>{cleanup();reject(Error('cancelled'));};
@@ -250,7 +250,8 @@
     const emptyShell=!input&&!running&&!generating&&!hasDraft&&/^\/app(?:\/[A-Za-z0-9_-]+)?$/.test(location.pathname)&&
       !document.querySelectorAll('user-query,model-response').length&&!buttons().length&&
       ![...document.querySelectorAll('a[href],[role="dialog"]')].some(visible);
-    return {ready:!!input&&!generating,empty_landing:emptyLanding(),empty_shell:emptyShell,has_draft:hasDraft,generating,busy:running,protocol:4,page_version:pageVersion,document_id:documentId};
+    const authenticated=[...document.querySelectorAll('a[href]')].some(a=>visible(a)&&a.getAttribute('href')?.startsWith('https://accounts.google.com/SignOutOptions'));
+    return {ready:!!input&&!generating,authenticated,empty_landing:emptyLanding(),empty_shell:emptyShell,has_draft:hasDraft,generating,busy:running,protocol:4,page_version:pageVersion,document_id:documentId,pageUrl:location.href};
   };
   chrome.runtime.onMessage.addListener((m,_,reply)=>{
     if(m.kind==='status')reply(status());
@@ -262,28 +263,31 @@
   });
   async function generate(task){
     running=true;activeTask=task.id;generationAbort=new AbortController();let result,step='start';
+    const advance=async value=>{
+      step=value;
+      await chrome.runtime.sendMessage({kind:'step',id:task.id,document_id:documentId,step,submitted:Boolean(activeAnchor)}).catch(()=>{});
+    };
     try{
       if(!editor())throw Error('login_required');
       const accepted=await chrome.runtime.sendMessage({kind:'started',id:task.id,document_id:documentId});
       if(!accepted?.ok)throw Error('page_changed');
       let blob;
       if(task.operation==='delete'){
-        step='delete';
+        await advance('delete');
         const deleted=await deleteConversation(task);result={id:task.id,ok:true,deleted:true,...deleted};
       }else if(task.image_url){
-        step='download';
+        await advance('download');
         blob=await downloadImage(()=>({src:task.image_url}),generationAbort.signal,task.expires);
       }else{
         if(task.conversation_title&&/^https:\/\/gemini\.google\.com\/app\//.test(task.page_url||'')){
-          step='rename';
+          await advance('prepare');
           await existingConversation(task);
-          await renameConversation(task.conversation_title);
         }
         // Page text is data. Only this request's submitted turn is read.
-        step='submit';const anchor=await submitPrompt(task);activeAnchor=anchor;
-        step='bind';
+        await advance('submit');const anchor=await submitPrompt(task);activeAnchor=anchor;
+        await advance('bind');
         await bindConversation(task);
-        step='response';
+        await advance('response');
         let conversationPath=/^\/app\/[^/]+$/.test(location.pathname)?location.pathname:undefined;
         const response=settledResponse(anchor);
         const found=await waitFor(()=>{
@@ -295,14 +299,20 @@
         },Math.max(1000,task.expires-Date.now()-5000));
         if(task.operation==='reset')result={id:task.id,ok:true,reset_complete:true};
         else if(found.text)result={id:task.id,ok:false,error:'text_response',text:found.text};
-        else {step='download';blob=await downloadImage(()=>readResponse(anchor)?.image,generationAbort.signal,task.expires);}
-        step='rename';
-        await renameConversation(task.conversation_title);
+        else {await advance('download');blob=await downloadImage(()=>readResponse(anchor)?.image,generationAbort.signal,task.expires);}
+        // Naming is metadata: a missing menu must not discard an already
+        // generated image or a refusal. Limit this work and retain the result.
+        if(task.conversation_title&&task.expires-Date.now()>5000){
+          await advance('rename');renameDeadline=Math.min(Date.now()+12_000,task.expires-3000);
+          try{await renameConversation(task.conversation_title);}catch{}
+          finally{renameDeadline=undefined;}
+        }
       }
       if(blob){
         const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(blob);});
         result={id:task.id,ok:true,mime_type:blob.type,data};
       }
+      await advance('result');
     }catch(e){result={id:task.id,ok:false,error:['login_required','quota','timeout','page_changed','conversation_unavailable','conversation_load_failed','submission_failed','download_failed','conversation_rename_failed','conversation_delete_failed'].includes(e.message)?e.message:'generation_failed',...(e.message==='download_failed'?{download_status:e.download_status||0}:{})};}
     try{
       while(!generationAbort.signal.aborted&&Date.now()<task.expires){
@@ -313,8 +323,11 @@
     }finally{running=false;activeTask=undefined;activeAnchor=undefined;generationAbort=undefined;}
     void ready();
   }
+  let checking=false;
   async function ready(){
+    if(checking)return;checking=true;
     try{const response=await chrome.runtime.sendMessage({kind:'ready',...status(),pageUrl:location.href});if(response?.task&&!running)void generate(response.task);}catch{}
+    finally{checking=false;}
   }
   setInterval(ready,3000);void ready();
 })();

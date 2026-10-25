@@ -67,7 +67,7 @@ export async function createApi(config:Config,bridge:Bridge) {
     res.header('Set-Cookie','bridge_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0');return {ok:true};
   });
   app.get('/api/health',async()=>({ok:true,mode:config.WECHAT_DEVICE_MODE,paused:bridge.paused,auto_reply:bridge.autoReply,
-    image:bridge.imageStatus(),replies:bridge.replyStatus(),web_search:config.HERMES_WEB_SEARCH,
+    voice:bridge.voiceStatus(),image:bridge.imageStatus(),replies:bridge.replyStatus(),web_search:config.HERMES_WEB_SEARCH,
     memory:{provider:bridge.memory.backend?'hermes':'local',scope:'member'},
     group_memory:{enabled:Boolean(bridge.driver.groupHistory),scope:'group',groups:bridge.groupMemory.states().map(g=>bridge.groupMemory.stats(g.chat_id))},
     reliability:bridge.lastReliability,last_error:bridge.lastError,ai_provider:config.AI_PROVIDER,
@@ -85,6 +85,10 @@ export async function createApi(config:Config,bridge:Bridge) {
     const job=await bridge.enqueue(id,body.content,idem);return res.code(202).send(job);
   });
   for(const path of ['/api/messages/at','/api/messages/image'])app.post(path,async(_,res)=>res.code(501).send({error:'not_supported_in_mvp'}));
+  app.post('/api/messages/recover-reply',async req=>{
+    const body=z.object({chat_id:z.string().regex(/^[\w-]+@chatroom$/),message_id:z.string().min(1).max(200)}).strict().parse(req.body);
+    return bridge.recoverQuotedReply(body.chat_id,body.message_id);
+  });
   app.get('/api/jobs/:id',async(req,res)=>{const {id}=z.object({id:z.string().uuid()}).parse(req.params);const job=bridge.store.job(id);return job??res.code(404).send({error:'job_not_found'});});
   app.post('/api/control',async(req)=>{const body=z.object({paused:z.boolean(),auto_reply:z.boolean().optional()}).strict().parse(req.body);bridge.control(body.paused,body.auto_reply);if(body.paused)await bridge.deviceIdle();return {paused:bridge.paused,auto_reply:bridge.autoReply,device_busy:bridge.deviceBusy};});
   app.get('/api/admin/state',async()=>{

@@ -14,6 +14,8 @@ import {ImageQueue,type ImageRequest} from './image-queue.js';
 import {GroupMemory} from './group-memory.js';
 import {ReplyQueue,type ReplyRequest} from './reply-queue.js';
 import {memberMemoryKey} from './hermes-memory.js';
+import {LocalVoice,speakable,type VoiceGenerator} from './voice.js';
+import {isBotReply} from './reply-context.js';
 
 export class WindowTracker {
   private previous:Snapshot|null=null;
@@ -34,6 +36,7 @@ export class WindowTracker {
 export class Bridge extends EventEmitter {
   private busy=false;private timer:NodeJS.Timeout|undefined;private trackers=new Map<string,WindowTracker>();private eventTrackers=new Map<string,WindowTracker>();private cursor=0;
   private replyRequests=new Map<string,Promise<void>>();private replyOwners=new Set<string>();private historyCursor=0;
+  private voiceBusy=false;
   private imageChain:Promise<void>=Promise.resolve();
   private imageRequests=new Map<string,{member:Member;session:string;controller:AbortController;maintenance:boolean}>();
   private commandChain:Promise<void>=Promise.resolve();private pendingCommands=0;
@@ -44,12 +47,13 @@ export class Bridge extends EventEmitter {
   private abort=new AbortController();private closed=false;
   paused:boolean;autoReply:boolean;lastReliability='not_started';lastError:string|null=null;activeChat:string|null=null;
   constructor(readonly config:Config,readonly driver:DeviceAdapter,readonly store:Store,private responder:Responder,
-    readonly memory=new Memories(store),readonly models=new Models(config,store),private images:ImageGenerator=new GeminiImages(config)){
+    readonly memory=new Memories(store),readonly models=new Models(config,store),private images:ImageGenerator=new GeminiImages(config),private voices:VoiceGenerator=new LocalVoice(config)){
     super();this.groupMemory=new GroupMemory(store);this.imageQueue=new ImageQueue(store);this.replyQueue=new ReplyQueue(store);this.wechatAdmin=new WechatAdmin(config,store);this.paused=store.get('paused')!=='false';this.autoReply=store.get('auto_reply')?store.get('auto_reply')==='true':config.WECHAT_AUTO_REPLY;
   }
   emitEvent(event:Record<string,unknown>){this.emit('event',event);}
   get deviceBusy(){return this.busy;}
   imageStatus(){return {...(this.images.status?.()??{provider:'proxy',model:this.config.IMAGE_MODEL}) as object,queue:this.imageQueue.status()};}
+  voiceStatus(){return this.voices.status?.()??{enabled:this.config.VOICE_ENABLED};}
   replyStatus(){return {active:this.replyRequests.size,pending:this.replyQueue.count(),queue:this.replyQueue.status()};}
   async deviceIdle(){while(this.busy)await new Promise(r=>setTimeout(r,25));}
   control(paused:boolean,autoReply?:boolean){
@@ -97,7 +101,9 @@ export class Bridge extends EventEmitter {
   }
   async enqueue(id:string,content:string,idem?:string){await this.allowedChat(id);return this.store.enqueue(id,content,idem);}
   private trigger(content:string,mention:Row['mention']):{text:string;isCommand:boolean}|null{
-    const pattern=new RegExp('(^|\\s)@'+this.config.WECHAT_BOT_NAME.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'(?=\\s|$)');
+    // Keep the previous account nickname usable during the Gemini rename.
+    const names=this.config.WECHAT_BOT_NAME==='Gemini'?['Gemini','Nila']:[this.config.WECHAT_BOT_NAME];
+    const pattern=new RegExp('(^|\\s)@(?:'+names.map(name=>name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|')+')(?=\\s|$)','i');
     const mentioned=this.config.WECHAT_REPLY_MODE==='text_mention'&&pattern.test(content);
     const text=mentioned?content.replace(pattern,' ').trim():content.trim();const isCommand=text.startsWith('/');
     return mention==='verified'||mentioned||isCommand?{text,isCommand}:null;
@@ -126,9 +132,15 @@ export class Bridge extends EventEmitter {
         if(this.paused||this.store.job(job.id)?.state!=='queued')return;
         this.store.update(job.id,'running');this.emitEvent({event:'job.updated',id:job.id,state:'running'});
         try{
-          const image=this.store.image(job.id);
-          const result=image===undefined?await this.driver.send(chat,job.content,job.id):
+          const image=this.store.image(job.id),voice=this.store.voice(job.id);
+          let result=voice!==undefined?(voice&&this.driver.sendVoice?await this.driver.sendVoice(chat,voice,job.id):{state:'failed' as const,reason:'voice_transport_unavailable'}):image===undefined?await this.driver.send(chat,job.content,job.id):
             image&&this.driver.sendImage?await this.driver.sendImage(chat,image,job.id):{state:'failed' as const,reason:'image_transport_unavailable'};
+          if(voice&&result.state==='failed'&&['voice_preflight_failed','wechat_voice_failed'].includes(result.reason)&&
+            !this.paused&&this.autoReply&&this.isAllowed(job.chat_id)&&!this.memory.group(job.chat_id)?.paused&&this.memory.valid(job.id)){
+            this.emitEvent({event:'voice.fallback',job_id:job.id,reason:result.reason});
+            result=await this.driver.send(chat,job.content,'voice-fallback:'+job.id);
+            if(result.state==='sent')result={...result,reason:'wechat_server_ack_text_fallback'};
+          }
           this.store.update(job.id,result.state,result.reason);
         }
         catch{this.store.update(job.id,'uncertain','device_error_no_automatic_retry');}
@@ -202,7 +214,8 @@ export class Bridge extends EventEmitter {
   }
   receive(message:Message){
     if(this.paused||!this.autoReply||message.own!==false||!this.isAllowed(message.chat_id)||message.chat_type!=='group')return;
-    const trigger=this.trigger(message.content,message.mention);if(!trigger)return;
+    const quoted=this.config.WECHAT_DEVICE_MODE==='android_hook'&&isBotReply(message);
+    const trigger=this.trigger(message.content,quoted?'verified':message.mention);if(!trigger)return;
     const {text,isCommand}=trigger;
     const imageCommand=/^\/img(?:\s+([\s\S]*))?$/i.exec(text);
     // Unreadable senders never share a single anonymous memory bucket.
@@ -259,12 +272,21 @@ export class Bridge extends EventEmitter {
       if(ahead>=100){
         this.store.enqueue(message.chat_id,member.name+'，回复队列已满，请稍后重试。','error:'+message.message_id);
       }else{
-        this.replyQueue.add({...message,content:text,member_id:member.id},member.id,member.revision);
+        // Persist the receipt-time choice, including turns waiting for the same
+        // member's memory commit. Finishing synthesis must not switch them back.
+        this.replyQueue.add({...message,content:text,member_id:member.id},member.id,member.revision,this.voiceBusy);
         if(ahead)this.store.enqueue(message.chat_id,member.name+'，消息已排队，前面还有 '+ahead+' 条。','progress:'+message.message_id);
       }
       this.store.db.exec('COMMIT');
     }catch(error){this.store.db.exec('ROLLBACK');throw error;}
     this.scheduleReplies();
+  }
+  async recoverQuotedReply(chat:string,id:string){
+    if(this.paused||!this.autoReply||!this.driver.quotedReply)throw new Error('reply_recovery_unavailable');
+    await this.allowedChat(chat);
+    const message=await this.driver.quotedReply(chat,id);if(!message)throw new Error('quoted_reply_not_found');
+    this.receive(message);
+    return {message_id:id,accepted:Boolean(this.store.db.prepare('SELECT 1 FROM seen WHERE id=?').get(id))};
   }
   private replyCurrent(request:ReplyRequest){
     const member=this.memory.member(request.chat_id,request.member_id);
@@ -291,18 +313,32 @@ export class Bridge extends EventEmitter {
   private async runReply(request:ReplyRequest,signal:AbortSignal){
     try{
       if(this.closed||signal.aborted||!this.replyCurrent(request))return;
-      const generated=await this.responder.reply(request.message,signal);
+      const textOnly=request.voice_blocked||this.voiceBusy||!this.config.VOICE_ENABLED||!this.driver.sendVoice;
+      const generated=await this.responder.reply(request.message,signal,{voice:textOnly?'text':'prefer'});
       let answer=(typeof generated==='string'?generated:generated.content).trim();
       if(!answer)throw Error('empty_reply');
       if(this.closed||signal.aborted||!this.replyCurrent(request))return;
       const member=this.memory.member(request.chat_id,request.member_id)!;
       const limit=this.config.WECHAT_DEVICE_MODE==='android_hook'?2000:100;
       if(answer.length>limit)answer=answer.slice(0,limit-9)+'…（已截短）';
+      let voice;
+      if(!textOnly&&typeof generated!=='string'&&generated.voice===true&&speakable(answer)){
+        // A second model may finish after the first has claimed the synthesizer.
+        // Claim synchronously and never queue another voice behind it.
+        if(this.voiceBusy)this.emitEvent({event:'voice.fallback',message_id:request.id,reason:'synthesis_busy_text_preserved'});
+        else{
+          this.voiceBusy=true;
+          try{voice=await this.voices.generate(answer,signal);}
+          catch{this.emitEvent({event:'voice.fallback',message_id:request.id,reason:'synthesis_unavailable_text_preserved'});}
+          finally{this.voiceBusy=false;}
+        }
+      }
       await this.allowedChat(request.chat_id);
       if(this.closed||signal.aborted||!this.replyCurrent(request))return;
       this.store.db.exec('BEGIN IMMEDIATE');try{
         const job=this.store.enqueue(request.chat_id,answer,'reply:'+request.id);
-        this.memory.stage(job.id,member,request.message.content,answer,typeof generated==='string'?undefined:generated.memory,typeof generated!=='string'&&generated.memory_scope==='group'?'group':'member');
+        if(voice)this.store.attachVoice(job,voice);
+        this.memory.stage(job.id,member,request.message.content,answer,typeof generated==='string'?undefined:generated.memory,isBotReply(request.message)||typeof generated!=='string'&&generated.memory_scope==='group'?'group':'member');
         this.replyQueue.update(request.id,'generated');this.store.db.exec('COMMIT');
       }catch(error){this.store.db.exec('ROLLBACK');throw error;}
     }catch(error){
@@ -366,7 +402,7 @@ export class Bridge extends EventEmitter {
           await this.images.resetSession(session,context,signal);
           if(signal.aborted||!this.imageCurrent(member,session,true))return;
           this.memory.imageSessionReady(member.chat_id,member.id,session);
-          const job=await this.enqueue(request.chat_id,'已删除旧生图对话，并新建「'+context.title+'」。所有群同步生效。','reply:'+request.id);
+          const job=await this.enqueue(request.chat_id,'已重建生图对话「'+context.title+'」。所有群同步生效。','reply:'+request.id);
           this.memory.trackImageJob(job.id,member,session);this.imageQueue.update(request.id,'completed');return;
         }
         if(!this.driver.sendImage)throw new Error('image_transport_unavailable');

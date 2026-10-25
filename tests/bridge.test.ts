@@ -44,6 +44,20 @@ test('ambiguous names rejected; independent chat IDs remain usable',async()=>{
   try {assert.equal((await app.inject({method:'POST',url:'/api/messages/send',headers:{authorization:'Bearer '+token},payload:{chat_name:'测试群',chat_type:'group',content:'hi'}})).statusCode,409);}
   finally{await app.close();s.store.close();}
 });
+test('Gemini rename accepts both mentions, strips the current name and rejects partial names',async()=>{
+  const s=setup();s.c.WECHAT_BOT_NAME='Gemini';s.c.WECHAT_REPLY_MODE='text_mention';
+  try{
+    await s.bridge.groups();s.bridge.control(false,true);
+    for(const [id,content] of [['rename-new','@Gemini\u2005你好'],['rename-old','@Nila 还在吗'],['rename-partial','@GeminiOther 不应回复'],['rename-email','user@Gemini 不应回复'],['rename-normal','Gemini 是名字']]){
+      s.bridge.receive({...message(id),content:content!,mention:'text'});await s.bridge.repliesIdle();await s.bridge.tick();
+    }
+    assert.deepEqual(s.calls.map(m=>m.content),['你好','还在吗']);
+    s.bridge.receive({...message('rename-command'),content:'@Gemini\u2005/help',mention:'text'});await s.bridge.repliesIdle();
+    const jobs=s.store.db.prepare('SELECT content FROM jobs').all();
+    assert(jobs.some(job=>String(job.content).startsWith('Gemini · 功能菜单\n')));
+    assert.equal(s.calls.length,2);
+  }finally{await s.bridge.close();s.store.close();}
+});
 test('new visible messages only, no historical replay, duplicates, own and untrusted mentions ignored',async()=>{
   const s=setup();s.driver.inject('old');await s.bridge.tick();assert.equal(s.calls.length,0);
   s.driver.inject('@AI助手 新消息');await s.bridge.tick();await s.bridge.tick();await s.bridge.repliesIdle();assert.equal(s.calls.length,1);

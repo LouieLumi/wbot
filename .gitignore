@@ -11,6 +11,7 @@ apps/gemini-extension/connection.js
 # Dependencies and generated output
 node_modules/
 dist/
+output/
 coverage/
 __pycache__/
 *.py[cod]

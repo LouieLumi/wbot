@@ -4,14 +4,18 @@ import {resolve} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {z} from 'zod';
 import type {Config} from './config.js';
-import type {Chat,DeviceAdapter,Message,SendResult,Snapshot,SignupRequest,GeneratedImage,GroupHistory} from '../../../packages/shared/types.js';
+import type {Chat,DeviceAdapter,Message,SendResult,Snapshot,SignupRequest,GeneratedImage,GeneratedVoice,GroupHistory} from '../../../packages/shared/types.js';
+import {validateVoice} from './voice.js';
 import {validateImage} from './images.js';
+import {isBotReply} from './reply-context.js';
 
 const exec=promisify(execFile);
 const chat=z.object({id:z.string().regex(/^[\w-]+@chatroom$/),name:z.string().max(128),type:z.literal('group'),verified:z.literal(true)});
 const event=z.object({event:z.literal('message.received'),message_id:z.string().min(1).max(200),chat_id:chat.shape.id,
   chat_name:z.string().max(128),chat_type:z.literal('group'),sender:z.string().min(1).max(128),sender_wxid:z.string().regex(/^[\w@.\-]{1,128}$/),
-  content:z.string().max(8000),own:z.literal(false),mention:z.enum(['text','none']),timestamp:z.number().finite(),seq:z.number().int().nonnegative()});
+  content:z.string().max(8000),own:z.literal(false),mention:z.enum(['text','none','reply']),timestamp:z.number().finite(),seq:z.number().int().nonnegative(),
+  reply_to:z.object({message_id:z.string().max(200),content:z.string().max(8000),type:z.enum(['text','image','other']),own:z.literal(true)}).optional()
+}).refine(m=>m.mention==='reply'?isBotReply(m):m.reply_to===undefined,'invalid_bot_quote');
 const batch=z.object({generation:z.string().uuid(),cursor:z.number().int().nonnegative(),oldest:z.number().int().nonnegative(),events:z.array(event).max(100)});
 const signup=z.object({request_id:z.string().regex(/^[\w@:.\-]{1,200}$/),chat_id:chat.shape.id,chat_name:z.string().min(1).max(128),requested_at:z.number().int().positive()});
 
@@ -41,6 +45,14 @@ export class AndroidHookDriver implements DeviceAdapter {
     }catch{this.forwardedAt=0;throw new Error('android_hook_unavailable');}
   }
   async status(){return z.record(z.string(),z.unknown()).parse(await this.call('/status'));}
+  async quotedReply(id:string,messageId:string):Promise<Message|null>{
+    const data=z.object({messages:z.array(z.unknown()).max(20)}).parse(await this.call('/replies/lookup',{chat_id:id,message_id:messageId,since:Date.now()-23*3600_000}));
+    if(!data.messages.length)return null;
+    if(data.messages.length!==1)throw new Error('ambiguous_quoted_reply');
+    const message=event.parse({...data.messages[0] as object,seq:0});
+    if(message.chat_id!==id||message.message_id!==messageId||!isBotReply(message))throw new Error('invalid_quoted_reply');
+    return message;
+  }
   async resolveAccount(wechatId:string):Promise<string|null>{
     const data=z.object({wechat_id:z.literal(wechatId),verified:z.boolean(),username:z.string().regex(/^[A-Za-z0-9_.-]{1,128}$/).nullable(),reason:z.string()})
       .parse(await this.call('/identity/resolve',{wechat_id:wechatId}));
@@ -86,6 +98,12 @@ export class AndroidHookDriver implements DeviceAdapter {
     const result=z.object({state:z.enum(['sent','failed','uncertain']),reason:z.string().max(128)}).parse(await this.call('/send',{chat_id:target.id,content,id}));
     if(result.state==='sent'&&result.reason!=='wechat_server_ack')return {state:'uncertain',reason:'unverified_server_ack'};
     return result;
+  }
+  async sendVoice(target:Chat,voice:GeneratedVoice,id:string):Promise<SendResult>{
+    validateVoice(voice);
+    const result=z.object({state:z.enum(['sent','failed','uncertain']),reason:z.string().max(128)}).parse(await this.call('/send/voice',
+      {chat_id:target.id,id,mime_type:voice.mime_type,duration_ms:voice.duration_ms,data:Buffer.from(voice.data).toString('base64')},75_000));
+    return result.state==='sent'&&result.reason!=='wechat_server_ack'?{state:'uncertain',reason:'unverified_server_ack'}:result;
   }
   async sendImage(target:Chat,image:GeneratedImage,id:string):Promise<SendResult>{
     validateImage(image.data,image.mime_type);

@@ -1,0 +1,3 @@
+# Separate environment: python3 -m venv .runtime/voice-venv
+mlx-audio==0.6.1
+pilk==0.2.4

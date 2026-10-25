@@ -55,7 +55,18 @@ def run_turn(request, snapshot, profile, configure):
         from hermes_group_recall import GroupRecall
         archive = request.get('group_archive', {})
         recall = GroupRecall(archive.get('database', ''), archive.get('chat_id', ''), archive.get('member_id', ''))
+        recall.used = request.get('group_quote') is True
         recall.register()
+        image_enabled = bool(request.get('group_image'))
+        if image_enabled:
+            from hermes_group_image import GroupImage
+            image_tool = GroupImage(request['group_image'], request, lambda: setattr(recall, 'used', True))
+            image_tool.register()
+        voice_tool = None
+        if request.get('voice_enabled') is True:
+            from hermes_voice_reply import VoiceReply
+            voice_tool = VoiceReply()
+            voice_tool.register()
         from hermes_member_memory import LIMIT
         from tools.memory_tool import MemoryStore
         seed = MemoryStore(LIMIT, LIMIT)
@@ -106,10 +117,14 @@ def run_turn(request, snapshot, profile, configure):
             reasoning_config=reasoning, request_overrides=overrides,
             skip_context_files=True, load_soul_identity=False, skip_memory=False, skip_background_review=True,
             session_id=snapshot['session_id'],
-            run_budget_seconds=150 if web else 90, cwd=str(workspace))
+            run_budget_seconds=210 if image_enabled else 150 if web else 90, cwd=str(workspace))
         agent._persist_disabled = True
         try:
             allowed = {'memory', 'group_recall', 'web_search'} if web else {'memory', 'group_recall'}
+            if image_enabled:
+                allowed.add('group_latest_image')
+            if voice_tool:
+                allowed.add('voice_reply')
             if set(agent.valid_tool_names) != allowed:
                 raise RuntimeError('unexpected_tools_enabled:' + ','.join(sorted(agent.valid_tool_names)))
             answer = agent.run_conversation(request['content'], system_message=request['system'], conversation_history=history)
@@ -128,7 +143,7 @@ def run_turn(request, snapshot, profile, configure):
         finally:
             agent.close()
     print(json.dumps({'content': text.strip(), 'provider': 'hermes', 'tools': used_tools, 'sources': sources[:5],
-                      'memory': None if recall.used else draft, 'memory_scope': 'group' if recall.used else 'member'}, ensure_ascii=False))
+                      'voice': bool(voice_tool and voice_tool.selected), 'memory': None if recall.used else draft, 'memory_scope': 'group' if recall.used else 'member'}, ensure_ascii=False))
 
 if __name__ == '__main__':
     try:

@@ -18,15 +18,30 @@ function run(name, args) {
 }
 try {
   run('javac', ['--release', '8', '-encoding', 'UTF-8', '-d', temporary,
+    'apps/android-wechat-module/src/local/nilabot/wechathook/SilkAudio.java',
+    'tests/android/SilkAudioTest.java']);
+  run('java', ['-cp', temporary, 'local.nilabot.wechathook.SilkAudioTest']);
+  run('javac', ['--release', '8', '-encoding', 'UTF-8', '-d', temporary,
+    'apps/android-wechat-module/src/local/nilabot/wechathook/BotMentions.java',
+    'tests/android/BotMentionsTest.java']);
+  run('java', ['-cp', temporary, 'local.nilabot.wechathook.BotMentionsTest']);
+  run('javac', ['--release', '8', '-encoding', 'UTF-8', '-d', temporary,
     'apps/android-wechat-module/src/local/nilabot/wechathook/TextSendLedger.java',
     'tests/android/TextSendLedgerTest.java']);
   run('java', ['-cp', temporary, 'local.nilabot.wechathook.TextSendLedgerTest', temporary]);
+  run('javac', ['--release', '8', '-encoding', 'UTF-8', '-d', temporary,
+    'apps/android-wechat-module/src/local/nilabot/wechathook/GroupImageMembers.java',
+    'tests/android/GroupImageMembersTest.java']);
+  run('java', ['-cp', temporary, 'local.nilabot.wechathook.GroupImageMembersTest']);
   const xmlPull = process.env.XMLPULL_JAR || join(root, '.runtime/android-sdk/cmdline-tools/latest/lib/external/net/sf/kxml/kxml2/2.3.0/kxml2-2.3.0.jar');
   if (existsSync(xmlPull)) {
     run('javac', ['--release', '8', '-encoding', 'UTF-8', '-cp', xmlPull, '-d', temporary,
       'apps/android-wechat-module/src/local/nilabot/wechathook/PrivateLinkCard.java',
+      'apps/android-wechat-module/src/local/nilabot/wechathook/GroupReplyCard.java',
+      'tests/android/GroupReplyCardTest.java',
       'tests/android/PrivateLinkCardTest.java']);
     run('java', ['-cp', temporary + delimiter + xmlPull, 'local.nilabot.wechathook.PrivateLinkCardTest']);
+    run('java', ['-cp', temporary + delimiter + xmlPull, 'local.nilabot.wechathook.GroupReplyCardTest']);
   } else {
     console.log('Private share-card parser test skipped: set XMLPULL_JAR or install Android command-line tools.');
   }

@@ -6,6 +6,29 @@ import {imageErrorReply} from '../apps/server/src/images.js';
 const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=','base64');
 const config=readConfig({BRIDGE_API_TOKEN:'b'.repeat(64),GEMINI_WEB_TOKEN:'a'.repeat(64),GEMINI_WEB_EXTENSION_ID:'a'.repeat(32),IMAGE_PROVIDER:'gemini_web'});
 const headers={host:'127.0.0.1:3152',authorization:'Bearer '+config.GEMINI_WEB_TOKEN,origin:'chrome-extension://'+config.GEMINI_WEB_EXTENSION_ID};
+test('task stages persist across restarts without prompts and keep failed sessions separate from later successes',async()=>{
+ const {Store}=await import('../apps/server/src/store.js'),store=new Store(':memory:');
+ const images=new GeminiWebImages(240_000,45_000,store),app=createGeminiWorker(config,images);images.heartbeat(true);
+ try{
+  const pending=images.generate('private prompt that must not enter diagnostics',new AbortController().signal),task=images.claim(true)!;
+  const failed=assert.rejects(pending,/image_cleanup_failed/);
+  await app.inject({method:'POST',url:'/heartbeat',headers,payload:{ready:true,protocol:4,task_id:task.id,phase:'generating',step:'delete',submitted:false}});
+  images.navigationFailureAt('update','retired_link_unavailable');
+  await app.inject({method:'POST',url:'/result',headers,payload:{id:task.id,ok:false,error:'conversation_delete_failed'}});await failed;
+  const second=images.generate('another private prompt',new AbortController().signal),next=images.claim(true)!;
+  images.progress(next.id,'response',true);images.progress(next.id,'response',false);
+  images.complete(next.id,{mime_type:'image/png',data:png});await second;
+  const restored=new GeminiWebImages(240_000,45_000,store),history=restored.history();
+  assert.equal(history[0]!.worker_error,'conversation_delete_failed');assert.equal(history[0]!.stage,'delete');
+  assert.equal(history[1]!.state,'succeeded');assert.equal(history[1]!.submitted,true);
+  assert.equal(history[1]!.steps.filter(s=>s.stage==='response').length,1);
+  assert.equal(images.status().worker_failure,null);assert.equal(images.status().navigation_failure,null);
+  assert(!JSON.stringify(history).includes('private prompt'));
+  assert.equal((await app.inject({method:'GET',url:'/tasks',headers:{host:headers.host}})).statusCode,401);
+  assert.equal((await app.inject({method:'GET',url:'/tasks',headers})).json().tasks.length,2);
+  restored.close();
+ }finally{await app.close();store.close();}
+});
 test('local extension reload is authenticated, idle-only, version-gated and consumed once',async()=>{
  const images=new GeminiWebImages(),app=createGeminiWorker(config,images);
  try{

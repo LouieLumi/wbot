@@ -240,6 +240,34 @@ test('feedback buttons with icon text still confirm a completed textual response
   assert.equal(p.read({index:0,text:'本次请求'}).text,reply.text);
 });
 
+test('a rename failure after generation cannot discard the image or the completed refusal',async()=>{
+ for(const mode of ['image','refusal']){
+  const messages:any[]=[];
+  class Element {children:any[]=[];innerText='';getClientRects(){return [1];}getAttribute(){return null;}}
+  const query={tagName:'USER-QUERY',innerText:'current prompt'},button=Object.assign(new Element(),{getAttribute:()=> '复制'});
+  const reply={tagName:'MODEL-RESPONSE',querySelector:()=>({innerText:mode==='refusal'?'无法生成这张图片。':''}),
+    querySelectorAll:(selector:string)=>selector==='img'&&mode==='image'?[{alt:'AI 生成',complete:true,naturalWidth:1024}]:selector==='button'?[button]:[]};
+  const context=vm.createContext({Date,Math,Blob,AbortController,HTMLElement:Element,location:{pathname:'/app/owned',href:'https://gemini.google.com/app/owned'},
+    setTimeout,clearTimeout,setInterval,clearInterval,
+    MutationObserver:class {observe(){}disconnect(){}},
+    FileReader:class {result='data:image/png;base64,dGVzdA==';onload?:()=>void;readAsDataURL(){this.onload?.();}},
+    document:{documentElement:{},addEventListener(){},removeEventListener(){},querySelector:()=>new Element(),
+      querySelectorAll:(selector:string)=>selector==='user-query'?[query]:selector==='user-query,model-response'?[query,reply]:[]},
+    chrome:{runtime:{onMessage:{addListener(){}},sendMessage:async(message:any)=>{messages.push(message);return {ok:true};}}}});
+  const source=readFileSync(new URL('../apps/gemini-extension/page.js',import.meta.url),'utf8').replace('setInterval(ready,3000);void ready();',`
+    submitPrompt=async()=>({index:0,text:'current prompt'});bindConversation=async()=>{};
+    downloadImage=async()=>new Blob(['image bytes'],{type:'image/png'});
+    renameConversation=async()=>{throw Error('conversation_rename_failed');};
+    globalThis.generateForTest=generate;`);
+  vm.runInContext(source,context);
+  await (context as any).generateForTest({id:'task',prompt:'current prompt',conversation_title:'A的对话',page_url:'https://gemini.google.com/app',expires:Date.now()+60_000});
+  const results=messages.filter(m=>m.kind==='result');assert.equal(results.length,1);assert.equal(results[0].submitted,true);
+  assert.equal(results[0].step,'result');assert(messages.some(m=>m.kind==='step'&&m.step==='rename'));
+  if(mode==='image'){assert.equal(results[0].result.ok,true);assert.equal(results[0].result.data,'dGVzdA==');}
+  else{assert.equal(results[0].result.error,'text_response');assert.equal(results[0].result.text,'无法生成这张图片。');}
+ }
+});
+
 test('completed image is recovered after Gemini replaces every optimistic message node',()=>{
   const {page,makeReply,query,read}=resultPage();
   const anchor={index:1,text:'画一艘货轮'};
@@ -341,7 +369,7 @@ test('extension dispatches a task after same-document navigation, only when the 
   const send=(message:object,from=sender)=>new Promise<any>(resolve=>listener({page_version:extensionVersion,...message},from,resolve));
   assert.equal((await send({kind:'ready',document_id:'old-doc',protocol:4,ready:true,pageUrl:current})).task,undefined);
   assert.equal((await send({kind:'ready',document_id:'new-doc',protocol:4,ready:false,pageUrl:current})).task,undefined);
-  assert.equal((await send({kind:'ready',document_id:'new-doc',protocol:4,ready:true,pageUrl:sender.url})).task,undefined);
+  assert.equal((await send({kind:'ready',document_id:'new-doc',protocol:4,ready:true,pageUrl:'https://gemini.google.com/app/unrelated'})).task,undefined);
   assert.equal((await send({kind:'ready',document_id:'new-doc',protocol:4,ready:true,pageUrl:current},{...sender,tab:{id:99}})).ignored,true);
   assert.equal((await send({kind:'ready',document_id:'new-doc',protocol:4,ready:true,pageUrl:current})).task.id,task.id);
   // A lost task response can be handed out again until the page acknowledges start.
@@ -393,7 +421,7 @@ function conversationWorker(state:Record<string,any>={tabId:17}){
     tabs:{get:async(id:number)=>{if(id!==tabId)throw Error('tab_closed');if(pendingUrl&&++pendingReads>=3){url=pendingUrl;pendingUrl='';doc++;}return {id:tabId,url,status:tabStatus,pendingUrl};},
       query:async()=>[{id:tabId,url,status:'complete'}],
       update:async(_id:number,patch:any)=>{if(patch.url){if(failNavigation)throw Error('tab_temporarily_unavailable');navigations.push(patch.url);if(delayedNavigation){pendingUrl=patch.url;pendingReads=0;}else{url=patch.url;doc++;}}},reload:async(_id:number,options:any)=>{if(failNavigation)throw Error('tab_temporarily_unavailable');reloadUrls.push(url);reloadOptions.push(options);pendingUrl='';doc++;},
-      sendMessage:async(_id:number,message:any)=>{if(message.kind==='cancel'){cancellations.push(message.id);return {ok:true};}return {ready:true,empty_landing:emptyLanding,busy:false,protocol:4,page_version:extensionVersion,document_id:'doc-'+doc,...pageStatus};}},
+      sendMessage:async(_id:number,message:any)=>{if(message.kind==='cancel'){cancellations.push(message.id);return {ok:true};}return {ready:true,empty_landing:emptyLanding,busy:false,protocol:4,page_version:extensionVersion,document_id:'doc-'+doc,pageUrl:url,authenticated:true,...pageStatus};}},
     runtime:{onInstalled:event(),onStartup:event(),onMessage:{addListener:(fn:any)=>{listener=fn;}}},alarms:{onAlarm:event()},action:{onClicked:event()},
   };
   const context=vm.createContext({chrome,endpoint:'http://127.0.0.1:3152',token:'test',AbortSignal,setTimeout:(fn:()=>void)=>queueMicrotask(fn),
@@ -642,7 +670,7 @@ test('navigation failures retry before dispatch, with a limit and no lost result
   for(let i=0;i<2;i++){failed.allowNavigationRetry();await failed.tick();}
   failed.failResult(true);failed.allowNavigationRetry();await failed.tick();assert.equal(failed.state.active.load_attempts,3);
   failed.failResult(false);await failed.tick();assert.equal(failed.state.active,undefined);
-  assert.equal(failed.calls.at(-1)?.body.error,'page_changed');
+  assert.equal(failed.calls.at(-1)?.body.error,'page_load_failed');
   const diagnostic=failed.calls.filter(call=>call.path==='/navigation-failure'&&call.body.message.startsWith('navigation_not_ready ')).at(-1)!;
   assert.equal(diagnostic.body.stage,'update');
   const detail=JSON.parse(diagnostic.body.message.slice('navigation_not_ready '.length));
@@ -689,6 +717,63 @@ test('a failed result upload retains the active user until acknowledgement, then
   worker.failResult(false);await worker.finish(first.id,'https://gemini.google.com/app/first');await worker.settle();
   assert.equal(worker.state.conversations[first.session_id],'https://gemini.google.com/app/first');
   assert.equal(worker.state.active.id,second.id);
+});
+
+test('a redirected document with stale Chrome URL forces a real reload of the retired target',async()=>{
+ const {randomUUID}=await import('node:crypto'),old=randomUUID(),saved='https://gemini.google.com/app/gone';
+ const worker=conversationWorker({tabId:17,conversations:{[old]:saved}});
+ worker.setUrl(saved+'#nila-image-worker-old');
+ worker.setPageStatus({pageUrl:'https://gemini.google.com/app',empty_landing:true});
+ worker.tasks.push({id:randomUUID(),session_id:randomUUID(),operation:'reset',retired_sessions:[old],expires:Date.now()+240_000});
+ await worker.tick();assert.equal(worker.navigations.length,0);assert.equal(worker.reloadUrls.length,1);
+ assert.equal(worker.state.active.page_url.split('#')[0],saved);
+ await worker.tick();worker.state.active.redirect_since=Date.now()-6000;await worker.tick();
+ assert.equal(worker.reloadUrls.length,2);assert.equal(worker.state.conversations[old],saved);
+ await worker.tick();worker.state.active.redirect_since=Date.now()-6000;await worker.tick();
+ assert.equal(worker.state.conversations[old],undefined);
+ assert.equal(worker.state.active.operation,'reset');
+});
+
+test('missing retired conversations are checked twice, retired locally and cannot block a reset or another member',async()=>{
+ const {randomUUID}=await import('node:crypto'),old=randomUUID(),other=randomUUID(),fresh=randomUUID();
+ const oldUrl='https://gemini.google.com/app/gone',otherUrl='https://gemini.google.com/app/other';
+ const worker=conversationWorker({tabId:17,conversations:{[old]:oldUrl,[other]:otherUrl}});
+ const task={id:randomUUID(),session_id:fresh,operation:'reset',conversation_title:'A的对话',retired_sessions:[old],prompt:'prepare',expires:Date.now()+240_000};
+ worker.tasks.push(task);await worker.tick();worker.setTabStatus('loading');
+ worker.setUrl('https://gemini.google.com/app');worker.setEmptyLanding(true);
+ await worker.tick();await worker.tick();assert.equal(worker.state.conversations[old],oldUrl);
+ assert.equal(worker.navigations.length,1);worker.state.active.redirect_since=Date.now()-6000;
+ await worker.tick();assert.equal(worker.state.active.missing_rechecked,true);assert.equal(worker.navigations.length,2);
+ assert.equal(worker.state.conversations[old],oldUrl);
+ worker.setUrl('https://gemini.google.com/app');await worker.tick();worker.state.active.redirect_since=Date.now()-6000;await worker.tick();
+ assert.equal(worker.state.conversations[old],undefined);assert.equal(worker.state.cleanup_receipts[old].outcome,'unavailable');
+ assert.equal(worker.state.conversations[other],otherUrl);assert.equal(worker.state.active.operation,'reset');
+ assert.equal(worker.state.active.load_attempts,1);assert.equal(worker.calls.filter(c=>c.path==='/result').length,0);
+ assert.equal((await worker.ready()).task.id,task.id);await worker.started(task.id);
+ await worker.resetDone(task.id,'https://gemini.google.com/app/fresh');await worker.settle();
+ assert.equal(worker.state.conversations[fresh],'https://gemini.google.com/app/fresh');
+ assert.equal(worker.calls.filter(c=>c.path==='/result').length,1);
+});
+
+test('an unauthenticated landing page or a transient redirect cannot retire a saved conversation',async()=>{
+ const {randomUUID}=await import('node:crypto');
+ for(const mode of ['login','draft','generating','transient'] as const){
+  const old=randomUUID(),fresh=randomUUID(),saved='https://gemini.google.com/app/owned';
+  const worker=conversationWorker({tabId:17,conversations:{[old]:saved}});
+  worker.tasks.push({id:randomUUID(),session_id:fresh,operation:'reset',retired_sessions:[old],expires:Date.now()+240_000});await worker.tick();
+  worker.setUrl('https://gemini.google.com/app');worker.setEmptyLanding(true);
+  worker.setPageStatus({authenticated:mode!=='login',has_draft:mode==='draft',generating:mode==='generating'});
+  await worker.tick();assert.equal(worker.state.conversations[old],saved);
+  if(mode==='transient'){
+   worker.setUrl(saved);worker.setEmptyLanding(false);worker.state.active.redirect_since=Date.now()-6000;await worker.tick();
+  }
+  assert.equal(worker.state.conversations[old],saved);assert.equal(worker.state.cleanup_receipts,undefined);
+ }
+});
+
+test('duplicate polling callbacks coalesce instead of queuing a backlog before results',async()=>{
+ const worker=conversationWorker();await Promise.all(Array.from({length:100},()=>worker.tick()));
+ assert.equal(worker.calls.filter(c=>c.path==='/claim').length,1);
 });
 
 test('reset visits only retired session URLs, preserves another user, then creates and binds the new conversation',async()=>{
@@ -742,12 +827,12 @@ test('conversation binding is saved before generation completes and rejects a di
  assert.equal(worker.state.conversations[task.session_id],'https://gemini.google.com/app/first');
 });
 
-test('new conversation binding waits for Chrome tab metadata and preserves a submitted conversation after failure',async()=>{
+test('new conversation binding uses the owned document when Chrome metadata lags and preserves it after failure',async()=>{
  const {randomUUID}=await import('node:crypto'),worker=conversationWorker();
  const task={id:randomUUID(),session_id:randomUUID(),prompt:'draw',expires:Date.now()+60_000};
  worker.tasks.push(task);await worker.tick();await worker.ready();await worker.started(task.id);
- assert.equal((await worker.boundBeforeTabUpdate(task.id,'https://gemini.google.com/app/new')).pending,true);
- assert.equal(worker.state.conversations,undefined);
+ assert.equal((await worker.boundBeforeTabUpdate(task.id,'https://gemini.google.com/app/new')).ok,true);
+ assert.equal(worker.state.conversations[task.session_id],'https://gemini.google.com/app/new');
  await worker.failedAfterSubmission(task.id,'https://gemini.google.com/app/new');await worker.settle();
  assert.equal((worker.state as Record<string,any>).conversations[task.session_id],'https://gemini.google.com/app/new');
  assert.equal(worker.calls.find(c=>c.path==='/result')!.body.error,'page_changed');
